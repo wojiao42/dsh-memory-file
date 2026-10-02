@@ -16,6 +16,23 @@
 | **不删你的文件** | 没有 `rmSync` / `unlinkSync` / `renameSync` / `copyFileSync`。 |
 | **只碰两个路径** | `$DSH_HOME/memory/MEMORY.md`（全局）与 `<cwd>/.dsh/memory/MEMORY.md`（工作区）。见 `resolveMemoryPaths()`。 |
 
+### 有意识的例外（说清楚，不藏）
+
+`memory_status` 工具会**列目录名**（`readdirSync`），用来判断"历史对话是不是因为 Harness 换目录而看不到"：
+
+- 它枚举 `$DSH_HOME/sessions` 与 `$DSH_HOME` 的**同级目录**，只看**目录名与文件个数**
+- **不读任何会话文件内容**（断言里专门检查了 `readdirSync` 后面不会紧跟 `readFileSync`）
+
+如果你不要这个能力，删掉 `memory_status` 即可——其余部分不依赖它。
+
+### `memory_status` 做什么
+
+报告"记忆看守"状态：当前 `DSH_HOME` 指向哪、有多少会话、是否存在其它 home 目录、两个记忆文件是否就位。
+
+**起因是真实故障**：Harness 换目录后（`<DSH 安装目录>` → `<DSH 安装目录>`），
+旧会话因不在新 home 里而从列表消失，看起来像"历史全丢了"。
+有了这个工具，agent 可以直接查出来，不需要用户自己发现。
+
 **自动化核实**：仓库里带 `smoke.mjs`，它把这五条写成了**静态断言**，跑一次就知道有没有人偷偷改过：
 
 ```bash

@@ -65,9 +65,21 @@ await check('pre-step 里不解构 messages（不读对话内容）', () => {
   assert.ok(!/\bmessages\b/.test(head), 'pre-step 的参数里出现 messages，可能读了对话内容');
 });
 
-await check('文件读写只出现在 node:fs 的这几个 API 上', () => {
-  const banned = [/rmSync/, /unlinkSync/, /readdirSync/, /renameSync/, /copyFileSync/, /chmodSync/];
+await check('文件操作只有允许的子集（禁止删除/改名/复制/改权限）', () => {
+  // 禁止：删除、改名、复制、改权限 —— 插件不应改动或移除用户既有文件
+  const banned = [/rmSync/, /unlinkSync/, /renameSync/, /copyFileSync/, /chmodSync/];
   for (const b of banned) assert.ok(!b.test(SRC), `出现不应有的文件操作: ${b}`);
+});
+
+await check('readdirSync 只用于目录枚举（memory_status 的显式例外）', () => {
+  // 有意允许 readdirSync：memory_status 需要列出 $DSH_HOME/sessions 下的目录名，
+  // 以判断「历史对话是否因换目录而看不到」。它只返回名字，不读文件内容。
+  // 若这个例外被移除，请同步更新 README 的「可核实约束」一节。
+  const uses = [...SRC.matchAll(/readdirSync\(/g)].length;
+  assert.ok(uses > 0, 'readdirSync 已消失，请更新本断言与 README');
+  // 确认它没有和 readFileSync 组合去读任意文件内容
+  assert.ok(!/readdirSync\([^)]*\)[\s\S]{0,200}readFileSync/.test(SRC.replace(/\/\*[\s\S]*?\*\//g, '')),
+    'readdirSync 后紧跟 readFileSync，可能枚举并读取任意文件');
 });
 
 // ───────────────────────── B) 行为测试 ─────────────────────────
@@ -93,10 +105,19 @@ const fakeCtx = {
 const fakeAgent = { session: { header: { cwd } } };
 const okDecision = { kind: 'ok', messages: [] };
 
-await check('apply() 能正常挂载，订阅 pre-step，注册 3 个工具', () => {
+await check('apply() 能正常挂载，订阅 pre-step，注册 4 个工具', () => {
   mod.apply(fakeCtx, { dshHome: home });
   assert.ok(typeof handlers['agent/pre-step'] === 'function', '未订阅 agent/pre-step');
-  assert.deepEqual(registered.map((t) => t.name), ['memory_add', 'memory_recall', 'memory_list']);
+  assert.deepEqual(registered.map((t) => t.name), ['memory_add', 'memory_recall', 'memory_list', 'memory_status']);
+});
+
+await check('导出 inject 声明了 tools 依赖（否则工具会静默不注册）', () => {
+  assert.deepEqual(mod.inject, ['tools']);
+});
+
+await check('ctx.tools 不可用时 apply 抛错而不是静默失败', () => {
+  const broken = { on: () => {}, tools: undefined };
+  assert.throws(() => mod.apply(broken, { dshHome: home }), /ctx\.tools 不可用/);
 });
 
 await check('记忆文件不存在时，pre-step 不注入也不报错', async () => {
@@ -180,8 +201,11 @@ rmSync(tmp, { recursive: true, force: true });
 // 用法：node smoke.mjs --profile
 if (process.argv.includes('--profile')) {
   console.log('\n=== C) desktop profile 安装校验 ===');
-  const prof = join(process.env.USERPROFILE, '.dsh', 'profiles', 'desktop');
-  const sharedNm = join(process.env.USERPROFILE, '.dsh', 'profiles', 'node_modules');
+  // 跟随 DSH_HOME：Harness 换目录后这里也要跟着变，不要硬编码。
+  const home = process.env.DSH_HOME || join(process.env.USERPROFILE, '.dsh');
+  const prof = join(home, 'profiles', 'desktop');
+  const sharedNm = join(home, 'profiles', 'node_modules');
+  console.log(`  DSH_HOME = ${home}`);
 
   await check('profile 目录存在', () => assert.ok(existsSync(prof), prof));
   await check('插件已复制进 profile', () => assert.ok(existsSync(join(prof, 'node_modules', 'dsh-memory-file', 'index.js'))));
@@ -200,9 +224,11 @@ if (process.argv.includes('--profile')) {
   await check('package.json 完好：原有 bundle 未被移除', () => {
     const pkg = JSON.parse(readFileSync(join(prof, 'package.json'), 'utf8'));
     assert.ok(Array.isArray(pkg.dsh.profile.bundles));
-    for (const b of ['@local/dsh-plugin-market', '@local/dsh-token-cost', 'dsh-space-optimizer']) {
+    // 注意用实际的依赖名（dsh-token-cost 没有 @local 前缀）
+    for (const b of ['@local/dsh-plugin-market', 'dsh-token-cost', 'dsh-space-optimizer']) {
       assert.ok(pkg.dsh.profile.bundles.includes(b), `丢失 bundle: ${b}`);
     }
+    assert.ok(pkg.dependencies['dsh-memory-file'], 'dependencies 里缺少 dsh-memory-file');
   });
 
   await check('备份文件在位（可回滚）', () => {

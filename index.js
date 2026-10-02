@@ -12,13 +12,20 @@
  * 如果后续有人修改本文件，请同时修改 README 的「可核实约束」一节，并重新核对上述三条。
  * 违反上述任一条都应当被视为破坏性变更。
  */
-import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync, appendFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync, appendFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { createUserMessage } from '@deepseek-ai/dsh-llm';
 import { defineTool } from '@deepseek-ai/dsh-tools';
 
 export const name = 'memory-file';
+
+/**
+ * 声明对 tools 服务的依赖。
+ * 缺少它时 cordis 不会等待服务就绪，`ctx.tools` 可能为 undefined，
+ * 工具会静默不注册——这个坑已经踩过一次，所以显式声明。
+ */
+export const inject = ['tools'];
 
 /** 单个记忆文件的最大注入字节数，防止一条巨型记忆撑爆上下文。 */
 const DEFAULT_MAX_BYTES = 16384;
@@ -191,11 +198,71 @@ export function apply(ctx, config = {}) {
     },
   });
 
-  for (const tool of [memoryAdd, memoryRecall, memoryList]) {
-    try {
-      ctx.tools.register(tool);
-    } catch {
-      // 注册失败不应让宿主起不来。
-    }
+  const memoryStatus = defineTool({
+    name: 'memory_status',
+    description:
+      '报告「记忆看守」状态：DSH_HOME 指向哪里、当前 home 有多少会话、是否存在散落在别处的会话备份、两个记忆文件是否就位。用于发现「历史对话突然看不到」这类目录漂移问题。',
+    parameters: {},
+    output: { schema: { type: 'object', additionalProperties: true, properties: { dshHome: { type: 'string', required: true }, sessions: { type: 'object', additionalProperties: true, required: true }, memoryFiles: { type: 'array', items: { type: 'object', additionalProperties: true }, required: true }, backups: { type: 'array', items: { type: 'object', additionalProperties: true }, required: true } } } },
+    async execute(_args, exec) {
+      const paths = pathsFor(exec?.agent);
+      const home = process.env.DSH_HOME || join(homedir(), '.dsh');
+
+      // 会话统计（只 stat，不读内容）
+      const sessionsDir = join(home, 'sessions');
+      const buckets = [];
+      let total = 0;
+      try {
+        for (const e of readdirSync(sessionsDir, { withFileTypes: true })) {
+          if (!e.isDirectory()) continue;
+          const dir = join(sessionsDir, e.name);
+          let n = 0;
+          for (const s of readdirSync(dir, { withFileTypes: true })) {
+            if (!s.isDirectory()) continue;
+            for (const f of readdirSync(join(dir, s.name))) {
+              if (/^session\.v\d+\.jsonl(\.zstd)?$/.test(f)) n++;
+            }
+          }
+          total += n;
+          buckets.push({ workspace: e.name, sessions: n });
+        }
+      } catch { /* home 不可读就留空 */ }
+
+      // 找同级的其它 home 目录（重装/换目录后旧数据常留在这里）
+      const backups = [];
+      try {
+        const parent = dirname(resolve(home));
+        for (const e of readdirSync(parent, { withFileTypes: true })) {
+          if (!e.isDirectory()) continue;
+          const cand = join(parent, e.name);
+          if (cand === resolve(home)) continue;
+          for (const sub of ['home', 'backup', 'sessions']) {
+            const p = join(cand, sub);
+            if (existsSync(p) && statSync(p).isDirectory()) {
+              backups.push({ path: p, looksLikeOtherHome: sub === 'home' || sub === 'sessions' });
+            }
+          }
+        }
+      } catch { /* 父目录不可读就跳过 */ }
+
+      const memoryFiles = [];
+      for (const [scope, file] of [['global', paths.global], ['workspace', paths.workspace]]) {
+        if (!file) continue;
+        if (!existsSync(file)) { memoryFiles.push({ scope, file, exists: false }); continue; }
+        const st = statSync(file);
+        memoryFiles.push({ scope, file, exists: true, bytes: st.size, modifiedAt: st.mtime.toISOString() });
+      }
+
+      return { dshHome: home, sessions: { total, buckets }, memoryFiles, backups };
+    },
+  });
+
+  // 注册工具。注册失败必须可见——静默吞掉会让「工具不工作」变成一个查不出的谜。
+  const toolset = [memoryAdd, memoryRecall, memoryList, memoryStatus];
+  if (!ctx.tools || typeof ctx.tools.register !== 'function') {
+    throw new Error(
+      'memory-file: ctx.tools 不可用，工具未注册。请在插件里保持 `export const inject = [\'tools\']`。',
+    );
   }
+  for (const tool of toolset) ctx.tools.register(tool);
 }

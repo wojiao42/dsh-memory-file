@@ -1,29 +1,29 @@
-{
-  "name": "dsh-memory-file",
-  "version": "0.1.0",
-  "private": false,
-  "description": "File-backed memory for DeepSeek Harness: injects your own Markdown memory file each session and gives the agent tools to read/write it. Never reads conversations, never opens a network connection.",
-  "type": "module",
-  "license": "MIT",
-  "keywords": [
-    "dsh-plugin",
-    "deepseek-harness",
-    "dsh",
-    "cordis",
-    "memory",
-    "markdown"
-  ],
-  "exports": {
-    ".": "./index.js"
-  },
-  "files": [
-    "index.js",
-    "cordis.patch.yml",
-    "README.md"
-  ],
-  "dsh": {
-    "bundle": {
-      "patch": "./cordis.patch.yml"
-    }
-  }
+﻿{
+    "name":  "dsh-memory-file",
+    "version":  "0.2.0",
+    "private":  false,
+    "description":  "File-backed memory for DeepSeek Harness: injects your own Markdown memory file each session, adds read/write tools, and reports DSH_HOME drift so session history never silently disappears. Never reads conversations, never opens a network connection.",
+    "type":  "module",
+    "license":  "MIT",
+    "keywords":  [
+                     "dsh-plugin",
+                     "deepseek-harness",
+                     "dsh",
+                     "cordis",
+                     "memory",
+                     "markdown"
+                 ],
+    "exports":  {
+                    ".":  "./index.js"
+                },
+    "files":  [
+                  "index.js",
+                  "cordis.patch.yml",
+                  "README.md"
+              ],
+    "dsh":  {
+                "bundle":  {
+                               "patch":  "./cordis.patch.yml"
+                           }
+            }
 }
