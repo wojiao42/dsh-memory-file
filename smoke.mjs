@@ -221,6 +221,14 @@ if (process.argv.includes('--profile')) {
     assert.equal(mf[0].config.maxBytes, 16384, 'maxBytes 应为 16384');
   });
 
+  await check('package.json 无 UTF-8 BOM（BOM 会让 pnpm 解析失败）', () => {
+    // 曾踩过：PowerShell `Out-File -Encoding utf8` 会写入 EF BB BF，
+    // pnpm 的 readPackageJson 随即抛错，导致重装静默保留旧版本。
+    const b = readFileSync(join(import.meta.dirname, 'package.json'));
+    assert.ok(!(b[0] === 0xef && b[1] === 0xbb && b[2] === 0xbf), 'package.json 带 UTF-8 BOM');
+    assert.equal(b[0], 0x7b, 'package.json 应以 { 开头');
+  });
+
   await check('package.json 完好：原有 bundle 未被移除', () => {
     const pkg = JSON.parse(readFileSync(join(prof, 'package.json'), 'utf8'));
     assert.ok(Array.isArray(pkg.dsh.profile.bundles));
