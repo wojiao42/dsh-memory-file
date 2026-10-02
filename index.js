@@ -112,7 +112,12 @@ export function apply(ctx, config = {}) {
 
     let message;
     try {
-      message = createUserMessage({ content, source: { kind: 'memory-file', scope: 'injected' } });
+      // content 必须是 content-block 数组。传裸字符串会让会话事件在加载时
+      // 校验失败（"message has invalid content"），整个会话被判定为损坏并隔离。
+      message = createUserMessage({
+        content: [{ type: 'text', text: content }],
+        source: { kind: 'memory-file', scope: 'injected' },
+      });
     } catch {
       // 构造失败就放弃注入，绝不影响正常对话。
       return decision;
