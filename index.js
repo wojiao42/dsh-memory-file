@@ -75,6 +75,14 @@ function searchLines(text, terms) {
   return hits;
 }
 
+/** 人类可读的字节数。 */
+function formatBytes(n) {
+  if (!Number.isFinite(n)) return '?';
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(2)} KB`;
+  return `${(n / 1024 / 1024).toFixed(2)} MB`;
+}
+
 export function apply(ctx, config = {}) {
   const maxBytes = Number.isFinite(config.maxBytes) ? config.maxBytes : DEFAULT_MAX_BYTES;
   const dshHome = config.dshHome;
@@ -145,7 +153,13 @@ export function apply(ctx, config = {}) {
       scope: { type: 'string', description: "写入位置：'workspace'（默认，当前工作区）或 'global'（所有工作区共享）。" },
       date: { type: 'string', description: '可选的日期前缀，格式 YYYY-MM-DD。' },
     },
-    output: { schema: { type: 'object', additionalProperties: false, properties: { file: { type: 'string', required: true }, added: { type: 'string', required: true } } } },
+    output: {
+      schema: { type: 'object', additionalProperties: false, properties: { file: { type: 'string', required: true }, added: { type: 'string', required: true } } },
+      // render 是 ToolOutputDefinition 的**必填**字段：dsh-tools 的 defineTool 会无条件
+      // 包装 options.output.render，漏掉它就会在渲染工具结果时抛
+      // "output.render failed: userRender is not a function"。四个工具都必须给。
+      render: (_args, value) => [{ type: 'text', text: `已写入 ${value.file}\n${value.added}` }],
+    },
     async execute(args, exec) {
       const paths = pathsFor(exec?.agent);
       const file = args.scope === 'global' ? paths.global : paths.target;
@@ -164,7 +178,15 @@ export function apply(ctx, config = {}) {
     parameters: {
       terms: { type: 'string', required: true, description: '空格分隔的关键词，例如 "相机 镜头"。' },
     },
-    output: { schema: { type: 'object', additionalProperties: false, properties: { hits: { type: 'array', items: { type: 'string' }, required: true }, scanned: { type: 'array', items: { type: 'string' }, required: true } } } },
+    output: {
+      schema: { type: 'object', additionalProperties: false, properties: { hits: { type: 'array', items: { type: 'string' }, required: true }, scanned: { type: 'array', items: { type: 'string' }, required: true } } },
+      render: (_args, value) => {
+        if (value.hits.length === 0) {
+          return [{ type: 'text', text: value.scanned.length ? `未命中。已扫描：\n${value.scanned.join('\n')}` : '未命中：没有可读的记忆文件。' }];
+        }
+        return [{ type: 'text', text: `命中 ${value.hits.length} 行：\n${value.hits.map((h) => h.trim()).join('\n')}` }];
+      },
+    },
     async execute(args, exec) {
       const paths = pathsFor(exec?.agent);
       const terms = String(args.terms).split(/\s+/).filter(Boolean);
@@ -184,7 +206,17 @@ export function apply(ctx, config = {}) {
     name: 'memory_list',
     description: '列出记忆文件的位置、大小与修改时间，便于用户核对插件到底读了什么。',
     parameters: {},
-    output: { schema: { type: 'object', additionalProperties: false, properties: { files: { type: 'array', items: { type: 'object', additionalProperties: true }, required: true } } } },
+    output: {
+      schema: { type: 'object', additionalProperties: false, properties: { files: { type: 'array', items: { type: 'object', additionalProperties: true }, required: true } } },
+      render: (_args, value) => [{
+        type: 'text',
+        text: value.files.map((f) => {
+          if (!f.exists) return `${f.scope}: ${f.file}\n  （不存在）`;
+          const pct = (f.bytes / maxBytes) * 100;
+          return `${f.scope}: ${f.file}\n  ${formatBytes(f.bytes)} / 上限 ${formatBytes(maxBytes)}（${pct.toFixed(1)}%）· 修改于 ${f.modifiedAt}`;
+        }).join('\n'),
+      }],
+    },
     async execute(_args, exec) {
       const paths = pathsFor(exec?.agent);
       const files = [];
@@ -203,7 +235,18 @@ export function apply(ctx, config = {}) {
     description:
       '报告「记忆看守」状态：DSH_HOME 指向哪里、当前 home 有多少会话、是否存在散落在别处的会话备份、两个记忆文件是否就位。用于发现「历史对话突然看不到」这类目录漂移问题。',
     parameters: {},
-    output: { schema: { type: 'object', additionalProperties: true, properties: { dshHome: { type: 'string', required: true }, sessions: { type: 'object', additionalProperties: true, required: true }, memoryFiles: { type: 'array', items: { type: 'object', additionalProperties: true }, required: true }, backups: { type: 'array', items: { type: 'object', additionalProperties: true }, required: true } } } },
+    output: {
+      schema: { type: 'object', additionalProperties: true, properties: { dshHome: { type: 'string', required: true }, sessions: { type: 'object', additionalProperties: true, required: true }, memoryFiles: { type: 'array', items: { type: 'object', additionalProperties: true }, required: true }, backups: { type: 'array', items: { type: 'object', additionalProperties: true }, required: true } } },
+      render: (_args, value) => [{
+        type: 'text',
+        text: [
+          `DSH_HOME: ${value.dshHome}`,
+          `会话: ${value.sessions.total} 条（${value.sessions.buckets.length} 个工作区桶）`,
+          ...value.memoryFiles.map((f) => `记忆(${f.scope}): ${f.exists ? `${f.file} · ${formatBytes(f.bytes)}` : `${f.file}（不存在）`}`),
+          `同级其它 home/backup: ${value.backups.length ? value.backups.map((b) => b.path).join(' · ') : '无'}`,
+        ].join('\n'),
+      }],
+    },
     async execute(_args, exec) {
       const paths = pathsFor(exec?.agent);
       const home = process.env.DSH_HOME || join(homedir(), '.dsh');

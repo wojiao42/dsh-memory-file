@@ -3,7 +3,8 @@
  *
  * 做两件事：
  *   A) 审计断言：用静态检查证明插件不联网、不读对话内容、只读写规定的路径。
- *   B) 行为测试：用假的 ctx / agent 跑 apply()，验证注入与三个工具真的能工作。
+ *   B) 行为测试：用假的 ctx / agent 跑 apply()，验证注入与四个工具真的能工作，
+ *      并回归校验每个工具都实现了必填的 output.render。
  *
  * 运行：node smoke.mjs
  */
@@ -193,6 +194,44 @@ await check('注入内容里的 </system-reminder> 被转义（防框架闭合�
   const out = await handlers['agent/pre-step']({ agent, step: 1, signal: undefined }, async () => okDecision);
   const text = JSON.stringify(out.messages[0]);
   assert.ok(!text.includes('恶意内容 </system-reminder>'), '未转义，框架可被记忆内容闭合');
+});
+
+// ── 回归断言：output.render 是 ToolOutputDefinition 的**必填**字段 ──
+// 2026-10-03 踩过：四个工具都只声明了 output.schema，漏了 output.render。
+// dsh-tools@0.1.5-rc.2 的 defineTool 会**无条件**包装 options.output.render：
+//     render(args, value) { return userRender(args, value); }
+// userRender 为 undefined → 工具执行成功了，但结果渲染阶段抛
+//     tool "memory_add" returned invalid output: output.render failed:
+//     userRender is not a function
+// 表现为 memory_add / memory_list 直接报错。类型定义里 render 没有 `?`，
+// 属于必填 —— 所以这是插件的错，不是宿主的错。
+await check('四个工具都实现了 output.render（漏掉则结果无法渲染）', () => {
+  for (const t of registered) {
+    assert.equal(typeof t.output?.render, 'function', `${t.name} 缺少 output.render`);
+  }
+});
+
+await check('output.render 返回非空 ContentBlock[]（含命中与未命中两条分支）', async () => {
+  const statusTool = registered.find((t) => t.name === 'memory_status');
+  // 先写入一条已知记忆，保证 recall 的“命中”分支被覆盖
+  writeFileSync(join(cwd, '.dsh', 'memory', 'MEMORY.md'), '# 记忆\n\n- 渲染测试记忆行\n', 'utf8');
+  const cases = [
+    [addTool, { text: '渲染测试新事实' }, 'memory_add'],
+    [recallTool, { terms: '渲染测试记忆行' }, 'memory_recall 命中'],
+    [recallTool, { terms: '不存在的关键词xyz' }, 'memory_recall 未命中'],
+    [listTool, {}, 'memory_list'],
+    [statusTool, {}, 'memory_status'],
+  ];
+  for (const [tool, args, label] of cases) {
+    const value = await tool.execute(args, { agent: fakeAgent });
+    const blocks = tool.output.render(args, value);
+    assert.ok(Array.isArray(blocks) && blocks.length > 0, `${label} 未返回 ContentBlock[]`);
+    for (const b of blocks) {
+      assert.equal(b.type, 'text', `${label} 的块类型应为 text`);
+      assert.equal(typeof b.text, 'string', `${label} 的块缺 text`);
+      assert.ok(b.text.trim().length > 0, `${label} 的渲染文本为空`);
+    }
+  }
 });
 
 rmSync(tmp, { recursive: true, force: true });
