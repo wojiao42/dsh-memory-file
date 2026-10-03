@@ -46,6 +46,14 @@ node tools/publish.mjs --pr           # 仓库满 1 天后提收录 PR
 `--pr` 会先查仓库 `created_at`，**不满 1 天直接拒绝并告诉你还差多久**，
 不会去提一个必红的 PR。
 
+> ⚠️ **年龄门槛按 PR 的创建时刻算，不是按 CI 运行时刻。**
+> 上游 `pr-gate.yml` 把 `--pr-created "${{ steps.pr.outputs.created_at }}"` 传进校验脚本，
+> 所以"先提出来、等仓库长大了再重跑 CI"这条路走不通 —— 重跑时 PR 创建时刻没变，
+> 它会一直红。**必须等满 1 天之后再创建 PR。**
+>
+> 另：PR 的分支允许落后 `main`。gate 用 `git merge-base origin/main pr-head` 算本 PR 自己的
+> 贡献，所以不必为了"跟上上游"去重建分支（实测落后 68 个提交依然能正确判定）。
+
 ### 本机实际情况（2026-10-03）
 
 | 项 | 值 |
