@@ -1,6 +1,6 @@
 # dsh-memory-file
 
-给 DeepSeek Harness 的**文件型长期记忆**：每个会话开始注入你自己的 Markdown 记忆文件，并提供三个工具让 agent 读写它。
+给 DeepSeek Harness 的**文件型长期记忆**：每个会话开始注入你自己的 Markdown 记忆文件，并提供四个工具让 agent 读写它、核对它到底读过什么。
 
 **这个插件的核心卖点不是功能，是可核实性。** 它刻意做得很小，小到你能在几分钟内读完并自己确认它做了什么。
 
@@ -36,10 +36,11 @@
 **自动化核实**：仓库里带 `smoke.mjs`，它把这五条写成了**静态断言**，跑一次就知道有没有人偷偷改过：
 
 ```bash
-node smoke.mjs
+node smoke.mjs                 # 共 21 项断言：8 项审计（静态）+ 13 项行为
+node tools/publish-test.mjs    # 发布脚本的离线断言（纯函数，不联网）
 ```
 
-它同时做行为测试（16 项）。**任何一条审计断言失败，就不该再信任这个插件。**
+它同时做行为测试。**任何一条审计断言失败，就不该再信任这个插件。**
 
 ---
 
@@ -83,6 +84,7 @@ Harness 桌面端（profile 由应用托管，不要用 `dsh` CLI）：
 | `memory_add` | 追加一条事实到记忆文件（可指定 `scope: global` 写全局） |
 | `memory_recall` | 在记忆文件里做**纯文本**关键词搜索（多词为「与」） |
 | `memory_list` | 列出记忆文件位置、大小、修改时间——**用来核对插件到底读了什么** |
+| `memory_status` | 报告 `DSH_HOME`、会话数、同级其它 home、两个记忆文件是否就位——用来发现「历史对话凭空消失」 |
 
 **记忆文件格式**：就是普通 Markdown，没有私有语法。你可以随时手改。
 
@@ -123,6 +125,15 @@ Markdown 记忆文件
 2. **注入内容按 `maxBytes` 截断**，且会转义 `</system-reminder>` 防止记忆内容闭合框架。
 3. **`memory_recall` 是字面匹配**，不是语义检索。没搜到不代表没记过。
 4. **没有自动去重**。重复调用 `memory_add` 会写入重复行。
+
+## 收录状态
+
+- 仓库：<https://github.com/wojiao42/dsh-memory-file>（已带 `dsh-plugin` topic）
+- 目标目录：社区精选 [awesome-dsh-plugin](https://github.com/awesome-dsh-plugin/awesome-dsh-plugin)，
+  `dsh-plugin.org` 上的条目从它同步 —— **进了这个目录就等于进了插件市场**
+- 分类：`memory`
+- 不放 npm：市场客户端是 **npm 优先、GitHub 兜底**，`github:` 安装即可用
+- 发布流程与命令见 [PUBLISHING.md](./PUBLISHING.md)，脚本是 `tools/publish.mjs`
 
 ## 许可
 

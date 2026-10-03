@@ -1,6 +1,6 @@
 {
   "name": "dsh-memory-file",
-  "version": "0.2.0",
+  "version": "1.0.0",
   "private": false,
   "description": "File-backed memory for DeepSeek Harness: injects your own Markdown memory file each session, adds read/write tools, and reports DSH_HOME drift so session history never silently disappears. Never reads conversations, never opens a network connection.",
   "type": "module",
@@ -19,8 +19,13 @@
   "files": [
     "index.js",
     "cordis.patch.yml",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/wojiao42/dsh-memory-file.git"
+  },
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
