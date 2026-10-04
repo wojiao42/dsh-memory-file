@@ -7,12 +7,30 @@
  *      源码中不存在任何订阅消息内容的事件（如 `agent/message`、`user/message`）。
  *      唯一挂载的钩子是 `agent/pre-step`，且**只读取 agent 与会话 cwd**，不读 `messages` 的内容。
  *   2. 不联网。源码中不存在 `fetch` / `http` / `https` / `net` / `dns` / `tls` / WebSocket。
- *   3. 只读写两个路径下的 Markdown 文件（见 resolveMemoryPaths）。不触碰其他文件。
+ *   3. 不执行命令。源码中不存在 `child_process`。
+ *   4. 不删、不改名、不改权限。没有 `rmSync` / `unlinkSync` / `renameSync` / `chmodSync`。
+ *   5. 写入位置全部由 `resolveMemoryPaths` + `sidecarPaths` 推导，共三类：
+ *        - 记忆文件本身：`$DSH_HOME/memory/MEMORY.md`（全局）与 `<cwd>/.dsh/memory/MEMORY.md`（工作区）
+ *        - 备份：记忆文件同目录下的 `backup/MEMORY-<scope>-<时间戳>.md`
+ *        - 待审队列：记忆文件同目录下的 `MEMORY.pending.md`
  *
- * 如果后续有人修改本文件，请同时修改 README 的「可核实约束」一节，并重新核对上述三条。
+ *   敏感操作登记制（v1.1.0 起）：`readdirSync`（列目录）与 `copyFileSync`（复制）必须在调用处
+ *   用紧邻上一行的 `[audit:readdir]` / `[audit:copy]` 注释说明用途；`smoke.mjs` 会核对
+ *   「登记数量 == 实际调用数量」。想偷偷加一处枚举或复制，测试就会变红。
+ *
+ * 如果后续有人修改本文件，请同时修改 README 的「可核实约束」一节，并重新核对上述五条。
  * 违反上述任一条都应当被视为破坏性变更。
  */
-import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync, appendFileSync } from 'node:fs';
+import {
+  appendFileSync,
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { createUserMessage } from '@deepseek-ai/dsh-llm';
@@ -33,15 +51,16 @@ const DEFAULT_MAX_BYTES = 16384;
 /** 注入内容不得包含伪造的框架闭合标签。 */
 const FRAMEWORK_CLOSE = '</system-reminder>';
 
+/** 备份目录里最多报告多少条（undo --list 用，避免刷屏）。 */
+const MAX_BACKUP_LIST = 10;
+
 function escapeFramework(text) {
   return text.split(FRAMEWORK_CLOSE).join('<\\/system-reminder>');
 }
 
 /**
  * 记忆文件的候选路径，按优先级排列（先全局后工作区）。
- * 只在这两个位置读写：
- *   - 全局：$DSH_HOME/memory/MEMORY.md（默认 ~/.dsh/memory/MEMORY.md）
- *   - 工作区：<cwd>/.dsh/memory/MEMORY.md
+ * 写入目标：有工作区就用工作区的，否则用全局的。
  */
 function resolveMemoryPaths(cwd, dshHome) {
   const home = dshHome || process.env.DSH_HOME || join(homedir(), '.dsh');
@@ -55,6 +74,29 @@ function resolveMemoryPaths(cwd, dshHome) {
   };
 }
 
+/**
+ * 旁路文件（备份、待审队列）的位置，**全部由记忆文件路径推导**。
+ * 这是「只碰这几个位置」这条主张的实现方式：不接收任何外部路径。
+ */
+function sidecarPaths(memoryFile) {
+  const dir = dirname(memoryFile);
+  return {
+    backupDir: join(dir, 'backup'),
+    pendingFile: join(dir, 'MEMORY.pending.md'),
+  };
+}
+
+/** 记忆文件的 scope 标签，用于备份文件名。 */
+function scopeOf(file, paths) {
+  return file === paths.global ? 'global' : 'workspace';
+}
+
+/** 用给定 scope 解析出记忆文件与旁路文件。 */
+function targetFor(paths, scope) {
+  const file = scope === 'global' ? paths.global : paths.target;
+  return { file, scope: scope === 'global' ? 'global' : 'workspace', ...sidecarPaths(file) };
+}
+
 function readIfExists(file) {
   try {
     if (!existsSync(file)) return undefined;
@@ -62,6 +104,73 @@ function readIfExists(file) {
   } catch {
     return undefined;
   }
+}
+
+/** 本地日期 YYYY-MM-DD。 */
+function todayLocal(date = new Date()) {
+  const p = (n, len = 2) => String(n).padStart(len, '0');
+  return `${date.getFullYear()}-${p(date.getMonth() + 1)}-${p(date.getDate())}`;
+}
+
+/** 备份文件名用的本地时间戳 YYYYMMDD-HHMMSSmmm。 */
+function backupStamp(date = new Date()) {
+  const p = (n, len = 2) => String(n).padStart(len, '0');
+  return [
+    `${date.getFullYear()}${p(date.getMonth() + 1)}${p(date.getDate())}`,
+    `${p(date.getHours())}${p(date.getMinutes())}${p(date.getSeconds())}${p(date.getMilliseconds(), 3)}`,
+  ].join('-');
+}
+
+/**
+ * 写入前整份备份记忆文件。文件不存在时返回空字符串（首次创建没有可备份的内容）。
+ * 源与目标都由记忆文件路径推导，不接受外部路径。
+ */
+function backupBeforeWrite(file, scope) {
+  if (!existsSync(file)) return '';
+  const { backupDir } = sidecarPaths(file);
+  mkdirSync(backupDir, { recursive: true });
+  const dest = join(backupDir, `MEMORY-${scope}-${backupStamp()}.md`);
+  // [audit:copy] 仅用于写入前备份：源=记忆文件，目标=同目录 backup/ 下的推导路径
+  copyFileSync(file, dest);
+  return dest;
+}
+
+/** 最近的备份文件（按文件名排序，时间戳单调递增）。 */
+function latestBackup(file, scope) {
+  const { backupDir } = sidecarPaths(file);
+  if (!existsSync(backupDir)) return undefined;
+  const prefix = `MEMORY-${scope}-`;
+  // [audit:readdir] 枚举备份目录；只接受 MEMORY-<scope>-<时间戳>.md 形式的文件名
+  const names = readdirSync(backupDir).filter((n) => n.startsWith(prefix) && n.endsWith('.md'));
+  if (names.length === 0) return undefined;
+  names.sort();
+  return join(backupDir, names[names.length - 1]);
+}
+
+/** 备份文件清单（最近的在前）。 */
+function listBackups(file, scope) {
+  const { backupDir } = sidecarPaths(file);
+  if (!existsSync(backupDir)) return [];
+  const prefix = `MEMORY-${scope}-`;
+  // [audit:readdir] 枚举备份目录；同样只接受推导出的文件名形式
+  const names = readdirSync(backupDir).filter((n) => n.startsWith(prefix) && n.endsWith('.md'));
+  return names
+    .sort()
+    .reverse()
+    .slice(0, MAX_BACKUP_LIST)
+    .map((n) => {
+      const full = join(backupDir, n);
+      let bytes = 0;
+      let modifiedAt = '';
+      try {
+        const st = statSync(full);
+        bytes = st.size;
+        modifiedAt = st.mtime.toISOString();
+      } catch {
+        // 读不到就留空，不影响主流程
+      }
+      return { name: n, file: full, bytes, modifiedAt };
+    });
 }
 
 /** 从记忆文件里挑出与关键词匹配的行（纯文本匹配，不做语义检索）。 */
@@ -81,6 +190,61 @@ function formatBytes(n) {
   if (n < 1024) return `${n} B`;
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(2)} KB`;
   return `${(n / 1024 / 1024).toFixed(2)} MB`;
+}
+
+/** 待审文件的表头（首次创建时写入）。 */
+const PENDING_HEADER = [
+  '# 待审记忆',
+  '',
+  '> 低置信或待确认的条目。确认后用 `memory_pending`（action=accept）收进 MEMORY.md，或（action=drop）丢弃。',
+  '> 这个文件是普通 Markdown，你可以直接手改。',
+  '',
+].join('\n');
+
+/** 把一条待审条目追加进待审文件。 */
+function appendPending(pendingFile, entry) {
+  mkdirSync(dirname(pendingFile), { recursive: true });
+  if (!existsSync(pendingFile)) writeFileSync(pendingFile, PENDING_HEADER, 'utf8');
+  appendFileSync(pendingFile, `- [ ] ${entry}\n`, 'utf8');
+}
+
+/**
+ * 解析待审文件：未处理（`- [ ]`）的按出现顺序编号，从 1 开始。
+ * 返回 { open: [{index, line, text}], resolved: number }。
+ */
+function parsePending(text) {
+  const open = [];
+  let resolved = 0;
+  const lines = String(text || '').split('\n');
+  lines.forEach((line, i) => {
+    if (/^- \[ \] /.test(line)) {
+      open.push({ index: open.length + 1, line: i, text: line.replace(/^- \[ \] /, '') });
+    } else if (/^- \[[x-]\] /.test(line)) {
+      resolved++;
+    }
+  });
+  return { open, resolved };
+}
+
+/** 把待审文件里第 lineIndex 行的状态标记改写掉（accept → [x]，drop → [- ]）。 */
+function markPending(pendingFile, text, target, mark) {
+  const lines = String(text).split('\n');
+  if (!lines[target.line] || !/^- \[ \] /.test(lines[target.line])) {
+    throw new Error(`待审条目 ${target.index} 已被处理过，请重新 list。`);
+  }
+  lines[target.line] = lines[target.line].replace(/^- \[ \] /, `- [${mark}] `);
+  writeFileSync(pendingFile, lines.join('\n'), 'utf8');
+}
+
+/** 记录一次撤销，便于事后追溯（追加在备份目录，不动记忆文件）。 */
+function logUndo(file, scope, backupName, restoredEntry) {
+  const { backupDir } = sidecarPaths(file);
+  mkdirSync(backupDir, { recursive: true });
+  appendFileSync(
+    join(backupDir, 'undo.log'),
+    `${new Date().toISOString()} scope=${scope} backup=${backupName} restoredBytes=${restoredEntry}\n`,
+    'utf8',
+  );
 }
 
 export function apply(ctx, config = {}) {
@@ -142,34 +306,63 @@ export function apply(ctx, config = {}) {
   });
 
   // ─────────────────────────────────────────────────────────────
-  // 2) 工具：让 agent 能读、写、搜索、列出记忆（全部是文件操作）
+  // 2) 工具：让 agent 能读、写、搜索、列出、撤销、处理待审（全部是文件操作）
   // ─────────────────────────────────────────────────────────────
   const memoryAdd = defineTool({
     name: 'memory_add',
     description:
-      '把一条值得长期记住的事实追加到用户记忆文件（明文 Markdown）。用于用户明确要求记住、或确认了某个跨会话仍然成立的偏好/事实时。不要用它保存临时信息。',
+      '把一条值得长期记住的事实写进用户记忆文件（明文 Markdown）。默认直接写入；写前会把原文件整份备份到同目录 backup/，可用 memory_undo 撤回。拿不准的（低置信、需用户确认）用 pending=true 放进待审队列，别直接写进记忆。',
     parameters: {
       text: { type: 'string', required: true, description: '要记住的一条事实，一句话说清。' },
       scope: { type: 'string', description: "写入位置：'workspace'（默认，当前工作区）或 'global'（所有工作区共享）。" },
       date: { type: 'string', description: '可选的日期前缀，格式 YYYY-MM-DD。' },
+      source: { type: 'string', description: '可选来源：用户原话或出处，写进条目的「（来源：…）」。' },
+      pending: { type: 'boolean', description: 'true = 只放进待审队列（MEMORY.pending.md），不写进记忆文件。' },
     },
     output: {
-      schema: { type: 'object', additionalProperties: false, properties: { file: { type: 'string', required: true }, added: { type: 'string', required: true } } },
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          file: { type: 'string', required: true },
+          added: { type: 'string', required: true },
+          backup: { type: 'string', required: true },
+          pending: { type: 'boolean', required: true },
+        },
+      },
       // render 是 ToolOutputDefinition 的**必填**字段：dsh-tools 的 defineTool 会无条件
       // 包装 options.output.render，漏掉它就会在渲染工具结果时抛
-      // "output.render failed: userRender is not a function"。四个工具都必须给。
-      render: (_args, value) => [{ type: 'text', text: `已写入 ${value.file}\n${value.added}` }],
+      // "output.render failed: userRender is not a function"。每个工具都必须给。
+      render: (_args, value) => [
+        {
+          type: 'text',
+          text: value.pending
+            ? `已放进待审队列 ${value.file}\n${value.added}`
+            : `已写入 ${value.file}\n${value.added}${value.backup ? `\n备份：${value.backup}` : ''}`,
+        },
+      ],
     },
     async execute(args, exec) {
       const paths = pathsFor(exec?.agent);
-      const file = args.scope === 'global' ? paths.global : paths.target;
-      const line = `- ${args.date ? `[${args.date}] ` : ''}${String(args.text).replace(/\r?\n/g, ' ').trim()}`;
+      const scope = args.scope === 'global' ? 'global' : 'workspace';
+      const { file, pendingFile } = targetFor(paths, scope);
+      const date = /^\d{4}-\d{2}-\d{2}$/.test(String(args.date || '')) ? String(args.date) : todayLocal();
+      const source = String(args.source || '').replace(/\s+/g, ' ').trim();
+      const body = String(args.text).replace(/\r?\n/g, ' ').trim();
+      const entry = `[${date}] ${body}${source ? `（来源：${source}）` : ''}`;
+
+      if (args.pending === true) {
+        appendPending(pendingFile, entry);
+        return { file: pendingFile, added: `- [ ] ${entry}`, backup: '', pending: true };
+      }
+
       mkdirSync(dirname(file), { recursive: true });
+      const backup = backupBeforeWrite(file, scope);
       if (!existsSync(file)) writeFileSync(file, `# 记忆\n\n`, 'utf8');
-      appendFileSync(file, line + '\n', 'utf8');
-      return { file, added: line };
+      appendFileSync(file, `- ${entry}\n`, 'utf8');
+      return { file, added: `- ${entry}`, backup, pending: false };
     },
-    presentCall: (args) => ({ card: 'generic', title: '写入记忆', kind: 'write', rawInput: args.text }),
+    presentCall: (args) => ({ card: 'generic', title: args.pending ? '写入待审' : '写入记忆', kind: 'write', rawInput: args.text }),
   });
 
   const memoryRecall = defineTool({
@@ -204,16 +397,30 @@ export function apply(ctx, config = {}) {
 
   const memoryList = defineTool({
     name: 'memory_list',
-    description: '列出记忆文件的位置、大小与修改时间，便于用户核对插件到底读了什么。',
+    description: '列出记忆文件的位置、大小与修改时间（并报告备份数量与待审条数），便于用户核对插件到底读了什么。',
     parameters: {},
     output: {
-      schema: { type: 'object', additionalProperties: false, properties: { files: { type: 'array', items: { type: 'object', additionalProperties: true }, required: true } } },
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          files: {
+            type: 'array',
+            required: true,
+            items: {
+              type: 'object',
+              additionalProperties: true,
+              properties: {},
+            },
+          },
+        },
+      },
       render: (_args, value) => [{
         type: 'text',
         text: value.files.map((f) => {
           if (!f.exists) return `${f.scope}: ${f.file}\n  （不存在）`;
           const pct = (f.bytes / maxBytes) * 100;
-          return `${f.scope}: ${f.file}\n  ${formatBytes(f.bytes)} / 上限 ${formatBytes(maxBytes)}（${pct.toFixed(1)}%）· 修改于 ${f.modifiedAt}`;
+          return `${f.scope}: ${f.file}\n  ${formatBytes(f.bytes)} / 上限 ${formatBytes(maxBytes)}（${pct.toFixed(1)}%）· 修改于 ${f.modifiedAt}\n  备份 ${f.backups} 份 · 待审 ${f.pendingOpen} 条`;
         }).join('\n'),
       }],
     },
@@ -222,11 +429,159 @@ export function apply(ctx, config = {}) {
       const files = [];
       for (const [scope, file] of [['global', paths.global], ['workspace', paths.workspace]]) {
         if (!file) continue;
-        if (!existsSync(file)) { files.push({ scope, file, exists: false }); continue; }
+        const side = sidecarPaths(file);
+        const pendingText = readIfExists(side.pendingFile);
+        const pendingOpen = pendingText === undefined ? 0 : parsePending(pendingText).open.length;
+        if (!existsSync(file)) {
+          files.push({ scope, file, exists: false, backups: 0, pendingOpen });
+          continue;
+        }
         const st = statSync(file);
-        files.push({ scope, file, exists: true, bytes: st.size, modifiedAt: st.mtime.toISOString() });
+        files.push({
+          scope,
+          file,
+          exists: true,
+          bytes: st.size,
+          modifiedAt: st.mtime.toISOString(),
+          backups: listBackups(file, scope).length,
+          pendingOpen,
+        });
       }
       return { files };
+    },
+  });
+
+  const memoryUndo = defineTool({
+    name: 'memory_undo',
+    description:
+      '撤回最近一次写入：把记忆文件恢复成最近一次写入之前的整份内容（写前自动留的备份）。注意它会一并丢弃那之后的所有改动，包括用户手写的。想先看有哪些备份，用 list=true。',
+    parameters: {
+      scope: { type: 'string', description: "'workspace'（默认）或 'global'。" },
+      list: { type: 'boolean', description: 'true = 只列出可用备份，不做恢复。' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          mode: { type: 'string', required: true },
+          file: { type: 'string', required: true },
+          backup: { type: 'string', required: true },
+          backups: { type: 'array', items: { type: 'string' }, required: true },
+        },
+      },
+      render: (_args, value) => {
+        if (value.mode === 'listed') {
+          if (value.backups.length === 0) return [{ type: 'text', text: `${value.file}\n没有可用备份（说明这个记忆文件还没被本插件写过）。` }];
+          return [{ type: 'text', text: `${value.file}\n可用备份 ${value.backups.length} 份（最近在前）：\n${value.backups.join('\n')}` }];
+        }
+        return [{ type: 'text', text: `已恢复：${value.file}\n取自备份：${value.backup}\n（该备份之后的所有改动，包括手写内容，都已丢弃。）` }];
+      },
+    },
+    async execute(args, exec) {
+      const paths = pathsFor(exec?.agent);
+      const scope = args.scope === 'global' ? 'global' : 'workspace';
+      const { file } = targetFor(paths, scope);
+
+      if (args.list === true) {
+        return { mode: 'listed', file, backup: '', backups: listBackups(file, scope).map((b) => b.file) };
+      }
+
+      const backup = latestBackup(file, scope);
+      if (!backup) throw new Error(`没有可用备份（${file} 还没被本插件写过）。`);
+      const content = readFileSync(backup, 'utf8');
+      writeFileSync(file, content, 'utf8');
+      logUndo(file, scope, backup.split(/[\\/]/).pop(), Buffer.byteLength(content, 'utf8'));
+      return { mode: 'restored', file, backup, backups: [] };
+    },
+  });
+
+  const memoryPending = defineTool({
+    name: 'memory_pending',
+    description:
+      '处理待审队列（记忆文件同目录的 MEMORY.pending.md）：list 列出待确认条目；accept 把第 N 条收进记忆文件（写前备份）；drop 把第 N 条标记丢弃。低置信的事实走这里，别直接写进记忆。',
+    parameters: {
+      action: { type: 'string', required: true, description: "'list' | 'accept' | 'drop'。" },
+      scope: { type: 'string', description: "'workspace'（默认）或 'global'。" },
+      index: { type: 'number', description: 'accept / drop 时的条目序号（从 1 开始，来自 list 的输出）。' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          mode: { type: 'string', required: true },
+          file: { type: 'string', required: true },
+          memoryFile: { type: 'string', required: true },
+          entries: {
+            type: 'array',
+            required: true,
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                index: { type: 'number', required: true },
+                text: { type: 'string', required: true },
+              },
+            },
+          },
+          entry: { type: 'string', required: true },
+          backup: { type: 'string', required: true },
+          resolved: { type: 'number', required: true },
+        },
+      },
+      render: (_args, value) => {
+        if (value.mode === 'listed') {
+          if (value.entries.length === 0) {
+            return [{ type: 'text', text: `${value.file}\n待审队列为空（已处理 ${value.resolved} 条）。` }];
+          }
+          return [{
+            type: 'text',
+            text: `${value.file}\n待审 ${value.entries.length} 条（已处理 ${value.resolved} 条）：\n${value.entries.map((e) => `  ${e.index}. ${e.text}`).join('\n')}`,
+          }];
+        }
+        if (value.mode === 'accepted') {
+          return [{ type: 'text', text: `已收进记忆：${value.memoryFile}\n${value.entry}${value.backup ? `\n备份：${value.backup}` : ''}` }];
+        }
+        return [{ type: 'text', text: `已丢弃待审条目：${value.entry}` }];
+      },
+    },
+    async execute(args, exec) {
+      const paths = pathsFor(exec?.agent);
+      const scope = args.scope === 'global' ? 'global' : 'workspace';
+      const { file: memoryFile, pendingFile } = targetFor(paths, scope);
+      const text = readIfExists(pendingFile);
+      const parsed = parsePending(text);
+
+      if (args.action === 'list') {
+        return {
+          mode: 'listed',
+          file: pendingFile,
+          memoryFile,
+          entries: parsed.open.map((e) => ({ index: e.index, text: e.text })),
+          entry: '',
+          backup: '',
+          resolved: parsed.resolved,
+        };
+      }
+
+      const index = Number(args.index);
+      const target = parsed.open.find((e) => e.index === index);
+      if (!target) throw new Error(`待审队列里没有第 ${args.index} 条（当前待审 ${parsed.open.length} 条）。先 list 看看。`);
+
+      if (args.action === 'drop') {
+        markPending(pendingFile, text, target, '-');
+        return { mode: 'dropped', file: pendingFile, memoryFile, entries: [], entry: target.text, backup: '', resolved: parsed.resolved + 1 };
+      }
+
+      if (args.action !== 'accept') throw new Error(`未知 action：${args.action}（应为 list / accept / drop）。`);
+
+      mkdirSync(dirname(memoryFile), { recursive: true });
+      const backup = backupBeforeWrite(memoryFile, scope);
+      if (!existsSync(memoryFile)) writeFileSync(memoryFile, `# 记忆\n\n`, 'utf8');
+      appendFileSync(memoryFile, `- ${target.text}\n`, 'utf8');
+      markPending(pendingFile, text, target, 'x');
+      return { mode: 'accepted', file: pendingFile, memoryFile, entries: [], entry: target.text, backup, resolved: parsed.resolved + 1 };
     },
   });
 
@@ -256,12 +611,15 @@ export function apply(ctx, config = {}) {
       const buckets = [];
       let total = 0;
       try {
+        // [audit:readdir] 枚举 $DSH_HOME/sessions 下的工作区桶目录名（不读会话文件内容）
         for (const e of readdirSync(sessionsDir, { withFileTypes: true })) {
           if (!e.isDirectory()) continue;
           const dir = join(sessionsDir, e.name);
           let n = 0;
+          // [audit:readdir] 枚举桶下的会话目录名
           for (const s of readdirSync(dir, { withFileTypes: true })) {
             if (!s.isDirectory()) continue;
+            // [audit:readdir] 枚举会话目录下的文件名，只做正则计数，不读内容
             for (const f of readdirSync(join(dir, s.name))) {
               if (/^session\.v\d+\.jsonl(\.zstd)?$/.test(f)) n++;
             }
@@ -275,6 +633,7 @@ export function apply(ctx, config = {}) {
       const backups = [];
       try {
         const parent = dirname(resolve(home));
+        // [audit:readdir] 枚举 $DSH_HOME 的同级目录名，寻找旧 home/backup
         for (const e of readdirSync(parent, { withFileTypes: true })) {
           if (!e.isDirectory()) continue;
           const cand = join(parent, e.name);
@@ -301,7 +660,7 @@ export function apply(ctx, config = {}) {
   });
 
   // 注册工具。注册失败必须可见——静默吞掉会让「工具不工作」变成一个查不出的谜。
-  const toolset = [memoryAdd, memoryRecall, memoryList, memoryStatus];
+  const toolset = [memoryAdd, memoryRecall, memoryList, memoryUndo, memoryPending, memoryStatus];
   if (!ctx.tools || typeof ctx.tools.register !== 'function') {
     throw new Error(
       'memory-file: ctx.tools 不可用，工具未注册。请在插件里保持 `export const inject = [\'tools\']`。',
