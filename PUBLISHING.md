@@ -58,7 +58,7 @@ node tools/publish.mjs --pr           # 仓库满 1 天后提收录 PR
 
 | 项 | 值 |
 |---|---|
-| `gh` | 便携版 `C:\Users\<用户名>\AppData\Local\Programs\gh\bin\gh.exe`（2.101.0），`findGh()` 能找到 |
+| `gh` | 便携版 `%LOCALAPPDATA%\Programs\gh\bin\gh.exe`（2.101.0），`findGh()` 能找到 |
 | 令牌文件 | `<工作区根>\.gh-token`（**不在插件目录**，所以用环境变量或 `--token-file` 传入） |
 | 仓库 | `wojiao42/dsh-memory-file` 已存在、公开、topic 已设 —— 走的是"推送 + 提 PR"，不是"建仓" |
 | fork | `wojiao42/awesome-dsh-plugin` 已存在（含 `add-dsh-token-cost`、`add-dsh-space-optimizer` 分支） |
