@@ -1,8 +1,8 @@
 {
   "name": "dsh-memory-file",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "private": false,
-  "description": "File-backed memory for DeepSeek Harness: injects your own Markdown memory file each session, adds read/write tools, and reports DSH_HOME drift so session history never silently disappears. Never reads conversations, never opens a network connection.",
+  "description": "File-backed memory for DeepSeek Harness: injects your own Markdown memory file each session, adds read/write tools with backup and undo, reports DSH_HOME drift, and (opt-in) surfaces your own recent lines from local session logs so the agent can file them. Reads no conversations by default; never opens a network connection.",
   "type": "module",
   "license": "MIT",
   "keywords": [

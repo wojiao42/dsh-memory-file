@@ -34,8 +34,8 @@ export const AWESOME_REPO = 'awesome-dsh-plugin/awesome-dsh-plugin'
 
 /** 收录条目里的双语描述（与 README 的口径一致：先说能力，再说可核实的安全约束）。 */
 export const DESCRIPTION = {
-  en: 'File-backed memory: injects your own Markdown memory file at each session start, adds read/write tools, and reports DSH_HOME drift. It never reads conversations and never opens a network connection.',
-  zh: '文件型长期记忆：每个会话开始注入你自己的 Markdown 记忆文件，提供读写工具，并能查出 DSH_HOME 漂移。不读对话、不联网，且这两条可用源码逐条核实。',
+  en: 'File-backed memory: injects your own Markdown memory file at each session start, adds read/write tools with backup and undo, and reports DSH_HOME drift. Reads no conversations by default; an opt-in autoScan switch surfaces your own recent lines from local session logs. Never opens a network connection.',
+  zh: '文件型长期记忆：每个会话开始注入你自己的 Markdown 记忆文件，提供带备份与撤销的读写工具，并能查出 DSH_HOME 漂移。默认不读对话；可选开启 autoScan 后，才从本机会话日志里提取你自己的发言交给 agent 归档。不联网。',
 }
 
 /** 首个提交的主题（仓库已存在时只用 `chore: 同步 ...`）。 */

@@ -3,22 +3,28 @@
  *
  * 设计约束（安全主张可被外部核实，请对照源码逐条检查）：
  *
- *   1. 不读对话。本文件唯一导入的运行时依赖是 `node:fs` / `node:path` / `node:os`。
- *      源码中不存在任何订阅消息内容的事件（如 `agent/message`、`user/message`）。
- *      唯一挂载的钩子是 `agent/pre-step`，且**只读取 agent 与会话 cwd**，不读 `messages` 的内容。
+ *   1. 不读 `messages`。pre-step 的回调参数从不解构 `messages`，源码里也不订阅任何
+ *      携带消息内容的事件（如 `agent/message`、`user/message`）。
+ *      **唯一能触达对话内容的开关是 `autoScan`，默认 false。** 打开后插件会读
+ *      `$DSH_HOME/sessions/` 下的会话日志，只提取"你自己说的话"（带
+ *      `source.clientTimeZone` 的 `user/message`），用来提醒 agent"有新的持久事实可记"。
+ *      关闭时（默认）代码路径根本不触达会话目录 —— 这条由 smoke.mjs 的
+ *      「默认不读会话日志」断言守着。会话日志的读取在调用处用 `[audit:sessions]` 登记。
  *   2. 不联网。源码中不存在 `fetch` / `http` / `https` / `net` / `dns` / `tls` / WebSocket。
  *   3. 不执行命令。源码中不存在 `child_process`。
  *   4. 不删、不改名、不改权限。没有 `rmSync` / `unlinkSync` / `renameSync` / `chmodSync`。
- *   5. 写入位置全部由 `resolveMemoryPaths` + `sidecarPaths` 推导，共三类：
+ *   5. 写入位置全部由 `resolveMemoryPaths` + `sidecarPaths` 推导，共四类：
  *        - 记忆文件本身：`$DSH_HOME/memory/MEMORY.md`（全局）与 `<cwd>/.dsh/memory/MEMORY.md`（工作区）
  *        - 备份：记忆文件同目录下的 `backup/MEMORY-<scope>-<时间戳>.md`
  *        - 待审队列：记忆文件同目录下的 `MEMORY.pending.md`
+ *        - autoScan 游标：记忆文件同目录下的 `.autoscan.json`
+ *   6. 会话日志**只读**：不复制、不上传、不修改；扫描结果只用于生成注入文本。
  *
  *   敏感操作登记制（v1.1.0 起）：`readdirSync`（列目录）与 `copyFileSync`（复制）必须在调用处
  *   用紧邻上一行的 `[audit:readdir]` / `[audit:copy]` 注释说明用途；`smoke.mjs` 会核对
  *   「登记数量 == 实际调用数量」。想偷偷加一处枚举或复制，测试就会变红。
  *
- * 如果后续有人修改本文件，请同时修改 README 的「可核实约束」一节，并重新核对上述五条。
+ * 如果后续有人修改本文件，请同时修改 README 的「可核实约束」一节，并重新核对上述六条。
  * 违反上述任一条都应当被视为破坏性变更。
  */
 import {
@@ -33,6 +39,7 @@ import {
 } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
+import { zstdDecompressSync } from 'node:zlib';
 import { createUserMessage } from '@deepseek-ai/dsh-llm';
 import { defineTool } from '@deepseek-ai/dsh-tools';
 
@@ -53,6 +60,27 @@ const FRAMEWORK_CLOSE = '</system-reminder>';
 
 /** 备份目录里最多报告多少条（undo --list 用，避免刷屏）。 */
 const MAX_BACKUP_LIST = 10;
+
+/**
+ * autoScan 默认值：**关闭**。
+ * 打开后插件才会读 `$DSH_HOME/sessions` 下的会话日志、提取你自己的发言并提示 agent 合并。
+ * 默认关闭是刻意的：不让"读对话"变成默认行为。
+ */
+const DEFAULT_AUTO_SCAN = false;
+/** autoScan 单次最多展示多少条待合并发言。 */
+const DEFAULT_AUTO_SCAN_MAX_TURNS = 30;
+/** 待合并队列最多保留多少条（防止里面积压几千条）。 */
+const MAX_PENDING_TURNS = 300;
+/** autoScan 注入块的字符上限。 */
+const DEFAULT_AUTO_SCAN_MAX_CHARS = 4000;
+/** seen 去重表超过这个规模就裁剪，只留最近的。 */
+const MAX_SEEN_KEYS = 5000;
+/** 多帧 zstd 的帧魔数（DSH 的 session 日志是追加写的多帧）。 */
+const ZSTD_MAGIC = [0x28, 0xb5, 0x2f, 0xfd];
+/** 单个会话日志的读取上限：超过就跳过，避免一个巨型日志卡住会话首个请求。 */
+const MAX_SESSION_FILE_BYTES = 8 * 1024 * 1024;
+/** 单次扫描的读取总量上限：超了就收工，没来得及处理的文件下一轮继续（size 未推进）。 */
+const MAX_SCAN_BYTES = 32 * 1024 * 1024;
 
 function escapeFramework(text) {
   return text.split(FRAMEWORK_CLOSE).join('<\\/system-reminder>');
@@ -83,6 +111,7 @@ function sidecarPaths(memoryFile) {
   return {
     backupDir: join(dir, 'backup'),
     pendingFile: join(dir, 'MEMORY.pending.md'),
+    scanStateFile: join(dir, '.autoscan.json'),
   };
 }
 
@@ -173,6 +202,198 @@ function listBackups(file, scope) {
     });
 }
 
+// ─────────────────────────────────────────────────────────────
+// autoScan：读会话日志，提取「你自己的发言」→ 提示 agent 合并
+//   只在 autoScan 打开时由 pre-step 调用；也可由 memory_scan(action:'scan') 显式触发。
+//   只读，不复制、不上传；游标写在记忆文件同目录的 .autoscan.json。
+// ─────────────────────────────────────────────────────────────
+
+/** 解析 home（sessions 目录与全局记忆都挂在它下面）。 */
+function resolveHome(dshHome) {
+  return dshHome || process.env.DSH_HOME || join(homedir(), '.dsh');
+}
+
+/**
+ * 多帧 zstd 逐帧解压。
+ * 坑：DSH 的 `session.v*.jsonl.zstd` 是**追加写的多帧** zstd，
+ * `zstdDecompressSync` 只解第一帧，所以必须按魔数切帧、逐帧解、再拼起来。
+ */
+export function decodeSessionBuffer(buf) {
+  const offsets = [];
+  for (let i = 0; i + 3 < buf.length; i++) {
+    if (
+      buf[i] === ZSTD_MAGIC[0] &&
+      buf[i + 1] === ZSTD_MAGIC[1] &&
+      buf[i + 2] === ZSTD_MAGIC[2] &&
+      buf[i + 3] === ZSTD_MAGIC[3]
+    ) {
+      offsets.push(i);
+    }
+  }
+  if (offsets.length === 0) {
+    try {
+      return zstdDecompressSync(buf).toString('utf8');
+    } catch {
+      return buf.toString('utf8'); // 明文日志
+    }
+  }
+  const parts = [];
+  for (let k = 0; k < offsets.length; k++) {
+    const start = offsets[k];
+    const end = k + 1 < offsets.length ? offsets[k + 1] : buf.length;
+    try {
+      parts.push(zstdDecompressSync(buf.subarray(start, end)).toString('utf8'));
+    } catch {
+      // 跳过损坏帧，不中断整场扫描
+    }
+  }
+  return parts.join('');
+}
+
+/** 列出会话日志文件（按修改时间升序）。 */
+export function listSessionFiles(home) {
+  const sessionsDir = join(home, 'sessions');
+  const files = [];
+  if (!existsSync(sessionsDir)) return files;
+  try {
+    // [audit:readdir] 枚举 $DSH_HOME/sessions 下的工作区桶目录名
+    for (const bucket of readdirSync(sessionsDir, { withFileTypes: true })) {
+      if (!bucket.isDirectory()) continue;
+      const bucketDir = join(sessionsDir, bucket.name);
+      // [audit:readdir] 枚举桶下的会话目录名
+      for (const sess of readdirSync(bucketDir, { withFileTypes: true })) {
+        if (!sess.isDirectory()) continue;
+        const sessDir = join(bucketDir, sess.name);
+        // [audit:readdir] 枚举会话目录下的日志文件名（只接受 session.v<n>.jsonl[.zstd]）
+        for (const name of readdirSync(sessDir)) {
+          if (!/^session\.v\d+\.jsonl(\.zstd)?$/.test(name)) continue;
+          const full = join(sessDir, name);
+          try {
+            const st = statSync(full);
+            files.push({ session: sess.name, bucket: bucket.name, file: full, size: st.size, mtime: st.mtimeMs });
+          } catch {
+            // stat 不到就跳过这个文件
+          }
+        }
+      }
+    }
+  } catch {
+    // home 不可读就当没有会话
+  }
+  return files.sort((a, b) => a.mtime - b.mtime);
+}
+
+/**
+ * 从解压后的日志文本里抽出**真人发言**。
+ * 关键判别：`user/message` 大部分不是人说的（运行时上下文、技能目录、编排脚本提示词都长这样）。
+ * 真人发言带 `source.clientTimeZone`，注入的没有。
+ */
+export function extractUserTurns(text, session) {
+  const out = [];
+  for (const line of text.split('\n')) {
+    if (!line.trim()) continue;
+    let ev;
+    try {
+      ev = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (ev.type !== 'user/message') continue;
+    const data = ev.data || {};
+    if (!data.source || data.source.kind !== 'user') continue;
+    if (!data.source.clientTimeZone) continue;
+    const body = (data.content || [])
+      .filter((b) => b && b.type === 'text' && typeof b.text === 'string')
+      .map((b) => b.text)
+      .join('\n')
+      .trim();
+    if (!body) continue;
+    out.push({ session, seq: ev.seq ?? out.length, time: ev.time ?? null, text: body });
+  }
+  return out;
+}
+
+/** 读游标文件；不存在或坏了就当空。 */
+export function loadScanState(file) {
+  try {
+    const parsed = JSON.parse(readFileSync(file, 'utf8'));
+    return {
+      version: 1,
+      files: parsed.files && typeof parsed.files === 'object' ? parsed.files : {},
+      seen: parsed.seen && typeof parsed.seen === 'object' ? parsed.seen : {},
+      turns: Array.isArray(parsed.turns) ? parsed.turns : [],
+    };
+  } catch {
+    return { version: 1, files: {}, seen: {}, turns: [] };
+  }
+}
+
+export function saveScanState(file, state) {
+  mkdirSync(dirname(file), { recursive: true });
+  writeFileSync(file, `${JSON.stringify(state, null, 2)}\n`, 'utf8');
+}
+
+/**
+ * 增量扫描：只解码"大小变过"的会话文件，按 `session#seq` 去重。
+ * 返回本次新增的发言，并把它们追加进待合并队列（state.turns）。
+ */
+export function scanNewTurns(home, state) {
+  const added = [];
+  let scannedBytes = 0;
+  for (const f of listSessionFiles(home)) {
+    if (state.files[f.session] === f.size) continue; // 文件没变就不解码
+    // 边界：单文件过大直接跳过；本轮读取总量超限就收工（没推进 size 的文件下轮继续）
+    if (f.size > MAX_SESSION_FILE_BYTES) continue;
+    if (scannedBytes + f.size > MAX_SCAN_BYTES) break;
+    scannedBytes += f.size;
+    let buf;
+    try {
+      // [audit:sessions] 读会话日志文件（autoScan 的唯一数据来源，只读不写）
+      buf = readFileSync(f.file);
+    } catch {
+      continue;
+    }
+    for (const turn of extractUserTurns(decodeSessionBuffer(buf), f.session)) {
+      const key = `${turn.session}#${turn.seq}`;
+      if (state.seen[key]) continue;
+      state.seen[key] = 1;
+      added.push(turn);
+    }
+    state.files[f.session] = f.size;
+  }
+  added.sort((a, b) => (a.time || 0) - (b.time || 0));
+  if (added.length) state.turns = [...state.turns, ...added].slice(-MAX_PENDING_TURNS);
+  // 去重表无限增长会拖慢扫描，超限就只留最近的一半
+  const keys = Object.keys(state.seen);
+  if (keys.length > MAX_SEEN_KEYS) {
+    const keep = keys.slice(-Math.floor(MAX_SEEN_KEYS / 2));
+    state.seen = Object.fromEntries(keep.map((k) => [k, 1]));
+  }
+  return added;
+}
+
+/** 把待合并发言格式化成注入块。 */
+export function formatPendingTurns(turns, total, maxChars = DEFAULT_AUTO_SCAN_MAX_CHARS) {
+  const lines = turns.map((t, i) => {
+    const when = t.time ? new Date(t.time).toISOString().slice(0, 10) : '日期不详';
+    return `${i + 1}. [${when}] ${String(t.text).replace(/\s+/g, ' ')}`;
+  });
+  let body = lines.join('\n');
+  if (body.length > maxChars) body = `${body.slice(0, maxChars)}\n…（已截断）`;
+  return [
+    `<!-- autoScan：新对话待合并（共 ${total} 条，下面是最新的 ${turns.length} 条） -->`,
+    '以下是**你自己**最近在对话里说过的话（取自本机会话日志）：',
+    '',
+    body,
+    '',
+    '请判断其中有没有**关于你的持久事实**（身份、偏好、禁忌、长期项目、对已有记忆的修正）：',
+    '  · 有把握的 → `memory_add`（带上 source）',
+    '  · 拿不准的 → `memory_add(pending: true)` 进待审',
+    '  · 都没有 → 直接结束，不要为了凑数写',
+    '处理完调用 `memory_scan`（action: ack）推进游标；不 ack 的话下次会话还会提示。',
+  ].join('\n');
+}
+
 /** 从记忆文件里挑出与关键词匹配的行（纯文本匹配，不做语义检索）。 */
 function searchLines(text, terms) {
   const needles = terms.map((t) => t.toLowerCase()).filter(Boolean);
@@ -251,6 +472,15 @@ export function apply(ctx, config = {}) {
   const maxBytes = Number.isFinite(config.maxBytes) ? config.maxBytes : DEFAULT_MAX_BYTES;
   const dshHome = config.dshHome;
   const header = config.header ?? '以下是用户长期记忆文件的内容。它是用户自己维护的明文笔记，请作为背景参考。';
+  // autoScan：**默认关闭**。只有显式传 true 才会读会话日志（见文件头设计约束第 1 条）。
+  const autoScan = config.autoScan === true;
+  const autoScanMaxTurns = Number.isFinite(config.autoScanMaxTurns)
+    ? Math.max(1, config.autoScanMaxTurns)
+    : DEFAULT_AUTO_SCAN_MAX_TURNS;
+  const autoScanMaxChars = Number.isFinite(config.autoScanMaxChars)
+    ? Math.max(200, config.autoScanMaxChars)
+    : DEFAULT_AUTO_SCAN_MAX_CHARS;
+  const scanHome = resolveHome(dshHome);
 
   const pathsFor = (agent) => resolveMemoryPaths(agent?.session?.header?.cwd, dshHome);
 
@@ -275,6 +505,23 @@ export function apply(ctx, config = {}) {
       if (text === undefined || text.trim() === '') continue;
       parts.push(`<!-- scope: ${scope} (${file}) -->\n${text}`);
     }
+
+    // autoScan（默认关闭）：顺手把"还没合并的新发言"一起注入。
+    // 整段包在 try/catch 里 —— 扫描出的任何问题都不该影响注入，更不该影响对话本身。
+    if (autoScan) {
+      try {
+        const anchor = workspace || global;
+        const { scanStateFile } = sidecarPaths(anchor);
+        const scanState = loadScanState(scanStateFile);
+        scanNewTurns(scanHome, scanState);
+        saveScanState(scanStateFile, scanState);
+        const pending = scanState.turns.slice(-autoScanMaxTurns);
+        if (pending.length) parts.push(formatPendingTurns(pending, scanState.turns.length, autoScanMaxChars));
+      } catch {
+        // 扫描失败就当没有新发言，什么都不做
+      }
+    }
+
     if (parts.length === 0) {
       injected.add(agent);
       return decision;
@@ -585,6 +832,91 @@ export function apply(ctx, config = {}) {
     },
   });
 
+  const memoryScan = defineTool({
+    name: 'memory_scan',
+    description:
+      '查看/处理「新对话待合并」队列（autoScan）：status 看有没有待处理发言，preview 列出原话，scan 立即扫描一次会话日志，ack 推进游标（表示已处理完）。autoScan 默认为关闭，此时 pre-step 不会自动扫描，scan 就是手动触发的入口。',
+    parameters: {
+      action: { type: 'string', required: true, description: "'status' | 'preview' | 'scan' | 'ack'。" },
+      scope: { type: 'string', description: "'workspace'（默认）或 'global'。" },
+      limit: { type: 'number', description: 'preview 最多列出几条，默认 20。' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          action: { type: 'string', required: true },
+          enabled: { type: 'boolean', required: true },
+          file: { type: 'string', required: true },
+          memoryFile: { type: 'string', required: true },
+          pending: { type: 'number', required: true },
+          added: { type: 'number', required: true },
+          acked: { type: 'number', required: true },
+          scanned: { type: 'number', required: true },
+          turns: {
+            type: 'array',
+            required: true,
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                index: { type: 'number', required: true },
+                time: { type: 'string', required: true },
+                text: { type: 'string', required: true },
+              },
+            },
+          },
+        },
+      },
+      render: (_args, value) => [{
+        type: 'text',
+        text: value.turns.length
+          ? `待合并 ${value.pending} 条（autoScan ${value.enabled ? '已开启' : '关闭'}）：\n${value.turns.map((t) => `  ${t.index}. [${t.time}] ${t.text}`).join('\n')}`
+          : `待合并 ${value.pending} 条（autoScan ${value.enabled ? '已开启' : '关闭'}）· 本次新增 ${value.added} 条 · 本次 ack ${value.acked} 条 · 已去重 ${value.scanned} 条\n状态文件：${value.file}`,
+      }],
+    },
+    async execute(args, exec) {
+      const paths = pathsFor(exec?.agent);
+      const scope = args.scope === 'global' ? 'global' : 'workspace';
+      const { file: memoryFile, scanStateFile } = targetFor(paths, scope);
+      const state = loadScanState(scanStateFile);
+      const action = String(args.action || 'status').toLowerCase();
+      let added = 0;
+      let acked = 0;
+
+      if (action === 'scan') {
+        added = scanNewTurns(scanHome, state).length;
+        saveScanState(scanStateFile, state);
+      } else if (action === 'ack') {
+        acked = state.turns.length;
+        state.turns = [];
+        saveScanState(scanStateFile, state);
+      } else if (action !== 'status' && action !== 'preview') {
+        throw new Error(`未知 action：${args.action}（应为 status / preview / scan / ack）。`);
+      }
+
+      const limit = Number.isFinite(args.limit) ? Math.max(1, args.limit) : 20;
+      const turns = (action === 'preview' ? state.turns.slice(-limit) : []).map((t, i) => ({
+        index: i + 1,
+        time: t.time ? new Date(t.time).toISOString().slice(0, 10) : '日期不详',
+        text: String(t.text).replace(/\s+/g, ' ').slice(0, 200),
+      }));
+
+      return {
+        action,
+        enabled: autoScan,
+        file: scanStateFile,
+        memoryFile,
+        pending: state.turns.length,
+        added,
+        acked,
+        scanned: Object.keys(state.seen).length,
+        turns,
+      };
+    },
+  });
+
   const memoryStatus = defineTool({
     name: 'memory_status',
     description:
@@ -660,7 +992,7 @@ export function apply(ctx, config = {}) {
   });
 
   // 注册工具。注册失败必须可见——静默吞掉会让「工具不工作」变成一个查不出的谜。
-  const toolset = [memoryAdd, memoryRecall, memoryList, memoryUndo, memoryPending, memoryStatus];
+  const toolset = [memoryAdd, memoryRecall, memoryList, memoryUndo, memoryPending, memoryScan, memoryStatus];
   if (!ctx.tools || typeof ctx.tools.register !== 'function') {
     throw new Error(
       'memory-file: ctx.tools 不可用，工具未注册。请在插件里保持 `export const inject = [\'tools\']`。',
