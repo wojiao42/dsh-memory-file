@@ -38,6 +38,33 @@ export const DESCRIPTION = {
   zh: '文件型长期记忆：每个会话开始注入你自己的 Markdown 记忆文件，提供带备份与撤销的读写工具，并能查出 DSH_HOME 漂移。默认不读对话；可选开启 autoScan 后，才从本机会话日志里提取你自己的发言交给 agent 归档。不联网。',
 }
 
+/**
+ * 推送前的隐私扫描规则（显式清单，可逐条核对）。
+ *
+ * 正则刻意写成**断开的字符类**（例如 `DeepSeek[\\/]?Harness`）：这样规则字面量本身
+ * 不会被自己的规则命中 —— 否则每次推送都会因为"规则文件里写了这些词"而误报。
+ */
+export const PRIVATE_PATTERNS = [
+  { id: 'win-user-dir', re: /C:[\\/]{1,2}Users[\\/](?![\\/]?<)/, note: 'Windows 用户目录真实路径（占位写法放行）' },
+  { id: 'harness-install', re: /DeepSeek[\\/]?Harness/, note: '本机 Harness 安装目录名' },
+  { id: 'local-workspace', re: /deepseek[ _-]?workspace/i, note: '本机工作区路径' },
+  { id: 'github-token', re: /\b(?:ghp|gho|ghs|ghu|ghr)_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}/, note: 'GitHub 令牌' },
+  { id: 'api-key', re: /\bsk-[A-Za-z0-9]{20,}/, note: 'API key' },
+]
+
+/** 扫一段文本，返回命中的行（`{ line, id, text }`）。 */
+export function scanForPrivateData(text) {
+  const hits = []
+  String(text)
+    .split('\n')
+    .forEach((line, index) => {
+      for (const pattern of PRIVATE_PATTERNS) {
+        if (pattern.re.test(line)) hits.push({ line: index + 1, id: pattern.id, text: line.trim().slice(0, 120) })
+      }
+    })
+  return hits
+}
+
 /** 首个提交的主题（仓库已存在时只用 `chore: 同步 ...`）。 */
 export const COMMIT_SUBJECT = 'DSH 文件型长期记忆插件'
 
@@ -308,6 +335,34 @@ async function main() {
     GIT_CONFIG_COUNT: '1',
     GIT_CONFIG_KEY_0: 'http.extraheader',
     GIT_CONFIG_VALUE_0: authHeader,
+  }
+
+  // 4.5 推送前隐私扫描：命中就中止。这条闸门是 2026-10-06 加的 —— 之前
+  //     README 示例与测试夹具里混进过作者机器的真实信息（已重写历史清除）。
+  if (!dryRun) {
+    const tracked = git(['ls-files'])
+      .split('\n')
+      .map((line) => line.trim())
+      .filter(Boolean)
+    const found = []
+    for (const rel of tracked) {
+      const full = path.join(PLUGIN_ROOT, rel)
+      if (!fs.existsSync(full)) continue
+      let text
+      try {
+        text = fs.readFileSync(full, 'utf8')
+      } catch {
+        continue // 二进制或读不动：跳过（图片不参与文本扫描）
+      }
+      for (const hit of scanForPrivateData(text)) found.push({ file: rel, ...hit })
+    }
+    if (found.length > 0) {
+      console.error('')
+      console.error('推送前隐私扫描命中，已中止推送：')
+      for (const hit of found.slice(0, 20)) console.error(`  ${hit.file}:${hit.line}  [${hit.id}] ${hit.text}`)
+      throw new Error(`发现 ${found.length} 处疑似本机 / 隐私信息，拒绝推送。`)
+    }
+    console.log(`  隐私扫描：${tracked.length} 个被跟踪文件，无命中`)
   }
 
   // 5. 建仓 / 推送。幂等：origin 已指向目标仓库、且远端 main 与本地 HEAD 一致时跳过，

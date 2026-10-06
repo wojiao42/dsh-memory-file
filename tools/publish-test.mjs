@@ -11,7 +11,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 
-import { CATEGORY, DESCRIPTION, findToken, humanWait, licenseText, readToken, repoAgeOk, submissionYaml } from './publish.mjs'
+import { CATEGORY, DESCRIPTION, findToken, humanWait, licenseText, readToken, repoAgeOk, scanForPrivateData, submissionYaml } from './publish.mjs'
 
 let passed = 0
 const failures = []
@@ -156,6 +156,32 @@ check('英文描述含冒号加空格 → 被引号包住', () => {
 })
 check('分类是 memory（本插件做的事就是文件型长期记忆）', () => assert.equal(CATEGORY, 'memory'))
 check('中文描述不以半角句号结尾（中文用全角）', () => assert.ok(DESCRIPTION.zh.endsWith('。'), DESCRIPTION.zh))
+
+console.log('\n[6] 推送前隐私扫描（闸门的正反例）')
+check('抓到 Windows 真实用户目录', () => {
+  // 样本刻意**拼接**：闸门会扫描本仓库所有被跟踪文件，测试里不能出现连续的绝对路径字面量，
+  // 否则闸门会把测试用例本身当成隐私命中（这是它的正确行为，不是 bug）。
+  const sample = 'gh 在 ' + 'C:' + '\\' + 'Users' + '\\' + 'someone' + '\\AppData\\Local\\Programs\\gh\\bin\\gh.exe'
+  const hits = scanForPrivateData(sample)
+  assert.ok(hits.some((hit) => hit.id === 'win-user-dir'), '真实用户目录没被抓到')
+})
+check('放过占位写法（用户名位置是 <用户名>）', () => {
+  const placeholder = '| gh | ' + 'C:' + '\\' + 'Users' + '\\' + '<用户名>' + '\\AppData |'
+  assert.deepEqual(scanForPrivateData(placeholder), [])
+})
+check('抓到 GitHub 令牌与 API key 形态', () => {
+  const fakeToken = 'ghp_' + 'a'.repeat(36)
+  const fakeKey = 'sk-' + 'b'.repeat(40)
+  assert.ok(scanForPrivateData(`token=${fakeToken}`).some((hit) => hit.id === 'github-token'))
+  assert.ok(scanForPrivateData(`key=${fakeKey}`).some((hit) => hit.id === 'api-key'))
+})
+check('规则文件自身不会被自己的规则命中（否则每次推送都误报）', () => {
+  const source = fs.readFileSync(new URL('./publish.mjs', import.meta.url), 'utf8')
+  assert.deepEqual(scanForPrivateData(source), [])
+})
+check('干净文本零命中', () => {
+  assert.deepEqual(scanForPrivateData('# 记忆\n- 喜欢简洁的回答\n- 每周三晚上有固定安排\n'), [])
+})
 
 console.log('')
 if (failures.length === 0) {
