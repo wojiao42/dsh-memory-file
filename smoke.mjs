@@ -466,6 +466,43 @@ await check('会话目录不存在时静默无事（autoScan 打开也不报错�
   assert.ok(!JSON.stringify(out.messages).includes('新对话待合并'));
 });
 
+// ── v1.2.1：待审提醒（还有 N 条待审）──
+await check('注入里的「待审提醒」：有未处理条目时出现、处理完就消失', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'memfile-notice-'));
+  const agent = { session: { header: { cwd: dir } } };
+  const ctxN = { on: (ev, fn) => { handlers[ev] = fn; }, tools: { register: () => {} } };
+  mod.apply(ctxN, { dshHome: join(dir, 'home'), maxBytes: 65536 });
+
+  await addTool.execute({ text: '提醒测试：记忆里的一条' }, { agent });
+  await addTool.execute({ text: '提醒测试：待审的一条', pending: true }, { agent });
+
+  const first = await handlers['agent/pre-step']({ agent, step: 1, signal: undefined }, async () => okDecision);
+  const firstText = JSON.stringify(first.messages);
+  assert.ok(firstText.includes('待审提醒'), '有未处理待审时没提醒');
+  assert.ok(firstText.includes('**1** 条待审'), `提醒里的条数不对：${firstText.slice(0, 200)}`);
+
+  await pendingTool.execute({ action: 'drop', index: 1 }, { agent });
+
+  const agent2 = { session: { header: { cwd: dir } } };
+  const second = await handlers['agent/pre-step']({ agent: agent2, step: 1, signal: undefined }, async () => okDecision);
+  assert.ok(!JSON.stringify(second.messages).includes('待审提醒'), '处理完不该再提醒');
+  rmSync(dir, { recursive: true, force: true });
+});
+
+await check('待审提醒不会因为待审文件损坏而抛错', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'memfile-notice-bad-'));
+  const memoryDir = join(dir, '.dsh', 'memory');
+  mkdirSync(memoryDir, { recursive: true });
+  writeFileSync(join(memoryDir, 'MEMORY.md'), '# 记忆\n\n- 一条记忆\n', 'utf8');
+  writeFileSync(join(memoryDir, 'MEMORY.pending.md'), '\u0000 坏内容 - [ ] 半行\n', 'utf8');
+  const agent = { session: { header: { cwd: dir } } };
+  const ctxB = { on: (ev, fn) => { handlers[ev] = fn; }, tools: { register: () => {} } };
+  mod.apply(ctxB, { dshHome: join(dir, 'home') });
+  const out = await handlers['agent/pre-step']({ agent, step: 1, signal: undefined }, async () => okDecision);
+  assert.ok(Array.isArray(out.messages), '损坏的待审文件不该让注入失败');
+  rmSync(dir, { recursive: true, force: true });
+});
+
 await check('损坏的 zstd / 非法 JSON 不会让扫描抛错', () => {
   const badHome = join(tmp, 'bad-home');
   const badDir = join(badHome, 'sessions', 'b', 's');

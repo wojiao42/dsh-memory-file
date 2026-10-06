@@ -447,6 +447,12 @@ function parsePending(text) {
   return { open, resolved };
 }
 
+/** 待审文件里未处理（`- [ ]`）的条数；文件不存在返回 0。 */
+function countPending(text) {
+  if (text === undefined) return 0;
+  return parsePending(text).open.length;
+}
+
 /** 把待审文件里第 lineIndex 行的状态标记改写掉（accept → [x]，drop → [- ]）。 */
 function markPending(pendingFile, text, target, mark) {
   const lines = String(text).split('\n');
@@ -520,6 +526,22 @@ export function apply(ctx, config = {}) {
       } catch {
         // 扫描失败就当没有新发言，什么都不做
       }
+    }
+
+    // 待审提醒（v1.2.1）：告诉 agent 还有几条等你确认，省得用户自己去翻文件。
+    // 同样整段 try/catch —— 数不出来就当没有待审，绝不影响注入。
+    try {
+      const openCount =
+        countPending(readIfExists(sidecarPaths(global).pendingFile)) +
+        (workspace ? countPending(readIfExists(sidecarPaths(workspace).pendingFile)) : 0);
+      if (openCount > 0) {
+        parts.push(
+          `<!-- 待审提醒 -->\n还有 **${openCount}** 条待审记忆（尚未写进记忆文件）。` +
+            '用 `memory_pending` 的 `list` 看内容、`accept` 收进记忆、`drop` 丢弃 —— 不用等用户自己去翻文件。',
+        );
+      }
+    } catch {
+      // 读不到待审文件就当没有
     }
 
     if (parts.length === 0) {
