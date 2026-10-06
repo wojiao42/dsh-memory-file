@@ -455,12 +455,21 @@ async function main() {
         console.log(`  分支 ${branch} 已存在，复用它`)
       }
 
-      // d) 写条目文件
+      // d) 写条目文件。分支上已有这个文件时必须带 sha，否则 Contents API 报
+      //    422 "sha wasn't supplied" —— 用新描述更新一个已开 PR 的分支就走这条路。
+      let existingSha
+      try {
+        const existing = JSON.parse(ghRun(['api', `repos/${forkSlug}/contents/${relPath}?ref=${branch}`]))
+        if (typeof existing?.sha === 'string') existingSha = existing.sha
+      } catch {
+        existingSha = undefined // 文件还不存在：首次提交
+      }
       const raw = ghRun(['api', '--method', 'PUT', `repos/${forkSlug}/contents/${relPath}`, '--input', '-'], {
         input: JSON.stringify({
-          message: `Add ${repo}`,
+          message: existingSha ? `Update ${repo} submission` : `Add ${repo}`,
           content: Buffer.from(yaml, 'utf8').toString('base64'),
           branch,
+          ...(existingSha ? { sha: existingSha } : {}),
         }),
       })
       const parsed = JSON.parse(raw)
