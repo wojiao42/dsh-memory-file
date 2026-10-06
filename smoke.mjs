@@ -393,7 +393,7 @@ const scanTool = scanRegistered.find((t) => t.name === 'memory_scan');
 
 await check('会话日志夹具可解析：多帧 zstd + 只认带 clientTimeZone 的真人发言', () => {
   const lines = [
-    JSON.stringify({ type: 'user/message', seq: 1, time: 1791000000000, data: { source: { kind: 'user', clientTimeZone: 'Asia/Shanghai' }, content: [{ type: 'text', text: '我换了 64GB 内存' }] } }),
+    JSON.stringify({ type: 'user/message', seq: 1, time: 1791000000000, data: { source: { kind: 'user', clientTimeZone: 'Asia/Shanghai' }, content: [{ type: 'text', text: '我在学吉他' }] } }),
     JSON.stringify({ type: 'user/message', seq: 2, time: 1791000001000, data: { source: { kind: 'user' }, content: [{ type: 'text', text: '运行时注入的上下文，不算人说的' }] } }),
     JSON.stringify({ type: 'user/message', seq: 3, time: 1791000002000, data: { source: { kind: 'user', clientTimeZone: 'Asia/Shanghai' }, content: [{ type: 'text', text: '周末想去爬山' }] } }),
     JSON.stringify({ type: 'assistant/message', seq: 4, data: { content: [{ type: 'text', text: '好的' }] } }),
@@ -407,7 +407,7 @@ await check('会话日志夹具可解析：多帧 zstd + 只认带 clientTimeZon
   assert.equal(files.length, 1, `应发现 1 个会话日志，实际 ${files.length}`);
   const turns = mod.extractUserTurns(mod.decodeSessionBuffer(readFileSync(files[0].file)), 'sess-abc');
   assert.equal(turns.length, 2, `应只提取 2 条真人发言，实际 ${turns.length}`);
-  assert.ok(turns.some((t) => t.text.includes('64GB')), '漏了第一帧里的发言（多帧解码没做对？）');
+  assert.ok(turns.some((t) => t.text.includes('吉他')), '漏了第一帧里的发言（多帧解码没做对？）');
   assert.ok(!turns.some((t) => t.text.includes('运行时注入')), '把运行时注入当成用户发言了');
 });
 
@@ -417,7 +417,7 @@ await check('autoScan 关闭（默认）时，注入里不出现会话日志内�
   const agent = { session: { header: { cwd } } };
   const out = await handlers['agent/pre-step']({ agent, step: 1, signal: undefined }, async () => okDecision);
   const text = JSON.stringify(out.messages);
-  assert.ok(!text.includes('64GB'), 'autoScan 关闭时不应读到会话日志');
+  assert.ok(!text.includes('吉他'), 'autoScan 关闭时不应读到会话日志');
   assert.ok(!text.includes('新对话待合并'), 'autoScan 关闭时不应注入待合并块');
 });
 
@@ -427,7 +427,7 @@ await check('autoScan 打开后注入真人发言，且不含运行时注入、�
   const agent = { session: { header: { cwd } } };
   const out = await handlers['agent/pre-step']({ agent, step: 1, signal: undefined }, async () => okDecision);
   const text = JSON.stringify(out.messages);
-  assert.ok(text.includes('64GB'), '打开 autoScan 后应注入会话日志里的真人发言');
+  assert.ok(text.includes('吉他'), '打开 autoScan 后应注入会话日志里的真人发言');
   assert.ok(text.includes('爬山'), '两条真人发言都应带上');
   assert.ok(!text.includes('运行时注入的上下文'), '没有 clientTimeZone 的注入内容不应被当成用户发言');
   assert.ok(text.includes('memory_scan'), '注入块应提示用 memory_scan 推进游标');
@@ -441,7 +441,7 @@ await check('memory_scan status / preview / ack 工作正常', async () => {
 
   const pv = await scanTool.execute({ action: 'preview', limit: 5 }, { agent });
   assert.ok(pv.turns.length >= 2, 'preview 应列出待合并发言');
-  assert.ok(pv.turns.some((t) => t.text.includes('64GB')), 'preview 内容不对');
+  assert.ok(pv.turns.some((t) => t.text.includes('吉他')), 'preview 内容不对');
 
   const ack = await scanTool.execute({ action: 'ack' }, { agent });
   assert.ok(ack.acked >= 2, 'ack 应清掉待合并');
