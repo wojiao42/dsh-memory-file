@@ -665,5 +665,31 @@ if (process.argv.includes('--profile')) {
   });
 }
 
+await check('memory_status 数的是会话目录，不是日志文件数', async () => {
+  // 回归：一个会话可能同时留着 v3/v4 两代日志。按文件数会把 57 个会话报成 64 条，
+  // 而「会话数变少 = 目录漂移」是用户盯着的健康信号，虚高会让信号失真。
+  const statusHome = join(tmp, 'status-home');
+  const bucket = join(statusHome, 'sessions', '--D-status--');
+  mkdirSync(join(bucket, 'sess-1'), { recursive: true });
+  mkdirSync(join(bucket, 'sess-2'), { recursive: true });
+  mkdirSync(join(bucket, 'empty-dir'), { recursive: true }); // 没有日志的目录不该计
+  writeFileSync(join(bucket, 'sess-1', 'session.v3.jsonl.zstd'), 'x');
+  writeFileSync(join(bucket, 'sess-1', 'session.v4.jsonl.zstd'), 'x'); // 同一会话两代
+  writeFileSync(join(bucket, 'sess-2', 'session.v4.jsonl.zstd'), 'x');
+  const tool = registered.find((t) => t.name === 'memory_status');
+  assert.ok(tool !== undefined, '没注册 memory_status');
+  const saved = process.env.DSH_HOME;
+  process.env.DSH_HOME = statusHome;
+  try {
+    const value = await tool.execute({}, { agent: fakeAgent });
+    assert.equal(value.sessions.total, 2, '两个会话目录应报 2，实际 ' + value.sessions.total);
+    assert.equal(value.sessions.buckets.length, 1, '应只有 1 个工作区桶');
+    assert.equal(value.sessions.buckets[0].sessions, 2, '桶内会话数应为 2');
+  } finally {
+    if (saved === undefined) delete process.env.DSH_HOME;
+    else process.env.DSH_HOME = saved;
+  }
+});
+
 console.log(`\n结果：${pass} 通过，${fail} 失败`);
 process.exit(fail === 0 ? 0 : 1);

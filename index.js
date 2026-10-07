@@ -973,10 +973,12 @@ export function apply(ctx, config = {}) {
           // [audit:readdir] 枚举桶下的会话目录名
           for (const s of readdirSync(dir, { withFileTypes: true })) {
             if (!s.isDirectory()) continue;
+            // 数「会话目录」而不是「日志文件」：同一个会话可能同时留着 v3/v4 两代日志，
+            // 按文件数会把 57 个会话报成 64 条，而「会话数变少=目录漂移」是用户正在用的
+            // 健康信号，虚高会让信号失真。没有日志的目录也不计。
             // [audit:readdir] 枚举会话目录下的文件名，只做正则计数，不读内容
-            for (const f of readdirSync(join(dir, s.name))) {
-              if (/^session\.v\d+\.jsonl(\.zstd)?$/.test(f)) n++;
-            }
+            const entries = readdirSync(join(dir, s.name));
+            if (entries.some((f) => /^session\.v\d+\.jsonl(\.zstd)?$/.test(f))) n++;
           }
           total += n;
           buckets.push({ workspace: e.name, sessions: n });
