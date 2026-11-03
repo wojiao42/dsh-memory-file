@@ -52,8 +52,14 @@ export const name = 'memory-file';
  */
 export const inject = ['tools'];
 
-/** 单个记忆文件的最大注入字节数，防止一条巨型记忆撑爆上下文。 */
-const DEFAULT_MAX_BYTES = 16384;
+/**
+ * 注入的**安全阀**，不是「记忆配额」。
+ * 2026-10-08 从 16384 提到 1048576（1 MB）：16 KB 对中文只有约 5,500 字，
+ * 而用户明确要求「记忆必须能完整读到，不要截断」。1 MB ≈ 20 万 token，
+ * 在 1M 上下文里占 20%，仍足以拦住异常巨型文件，日常则永不触发。
+ * 要调：改这里，或在 profile 的 cordis.patch.yml 里传 config.maxBytes。
+ */
+const DEFAULT_MAX_BYTES = 1048576;
 
 /** 注入内容不得包含伪造的框架闭合标签。 */
 const FRAMEWORK_CLOSE = '</system-reminder>';
@@ -394,14 +400,57 @@ export function formatPendingTurns(turns, total, maxChars = DEFAULT_AUTO_SCAN_MA
   ].join('\n');
 }
 
-/** 从记忆文件里挑出与关键词匹配的行（纯文本匹配，不做语义检索）。 */
-function searchLines(text, terms) {
-  const needles = terms.map((t) => t.toLowerCase()).filter(Boolean);
-  const hits = [];
-  for (const line of text.split('\n')) {
-    const lower = line.toLowerCase();
-    if (needles.every((n) => lower.includes(n))) hits.push(line);
+/**
+ * 单个关键词对一行的证据强度。
+ * 整词命中 → 高分；否则退回「最长公共片段」，≥2 个字符才算证据（单个字太泛，只会带来噪声）。
+ */
+function scoreTerm(lower, term) {
+  if (lower.includes(term)) return { exact: true, score: 10 + term.length * 2 };
+  let overlap = 0;
+  for (let len = term.length - 1; len >= 2; len -= 1) {
+    let found = false;
+    for (let i = 0; i + len <= term.length; i += 1) {
+      if (lower.includes(term.slice(i, i + len))) { found = true; break; }
+    }
+    if (found) { overlap = len; break; }
   }
+  return { exact: false, score: overlap * 1.5 };
+}
+
+/**
+ * 从记忆文件里挑出与关键词相关的行，按相关度排序（纯文本，不做语义检索）。
+ *
+ * 2026-11-03 改（旧实现是「所有词都必须整词命中、无排序、不回行号」）：
+ *   · 多词改为 OR：任一词有证据就进结果；**全部整词命中**的额外加分，排在前面。
+ *     旧实现是全词 AND，导致「相机 镜头 尼康」这种组合搜不出任何行。
+ *   · 中文长词允许部分命中：整词不在行里时按最长公共片段（≥2 字）给分。
+ *     所以搜「孩子奥数」能命中只写了「三年级奥数」的行 —— 这是旧实现漏掉的真实案例。
+ *   · 返回行号（从 1 起）：方便按行回读原文。旧实现只回文本，定位要靠再搜一次。
+ *   · 同分时短行优先：短行更像一条事实，长段落往往只是路过关键词。
+ *
+ * @param {string} text 记忆文件全文
+ * @param {string[]} terms 关键词（已按空白拆开）
+ * @returns {{line: number, score: number, text: string}[]}
+ */
+function searchLines(text, terms) {
+  const clean = terms.map((t) => String(t).trim().toLowerCase()).filter(Boolean);
+  if (clean.length === 0) return [];
+  const hits = [];
+  const lines = String(text).split('\n');
+  lines.forEach((line, index) => {
+    const lower = line.toLowerCase();
+    let score = 0;
+    let exact = 0;
+    for (const term of clean) {
+      const found = scoreTerm(lower, term);
+      score += found.score;
+      if (found.exact) exact += 1;
+    }
+    if (score <= 0) return;
+    if (exact === clean.length) score += 12;
+    hits.push({ line: index + 1, score: Math.round(score * 10) / 10, text: line });
+  });
+  hits.sort((a, b) => b.score - a.score || a.text.length - b.text.length || a.line - b.line);
   return hits;
 }
 
@@ -552,7 +601,22 @@ export function apply(ctx, config = {}) {
     const body = escapeFramework(parts.join('\n\n---\n\n'));
     let content = `<system-reminder>\n${header}\n\n${body}\n</system-reminder>`;
     if (Buffer.byteLength(content, 'utf8') > maxBytes) {
-      content = `<system-reminder>\n${header}\n\n（记忆内容超过 ${maxBytes} 字节上限，已截断；请让用户精简记忆文件。）\n\n${escapeFramework(body.slice(0, maxBytes))}\n</system-reminder>`;
+      // 按【字节】截断，而不是按字符：body 是 JS 字符串，slice() 数的是 UTF-16 码元，
+      // 中文 3 字节/字，按字符切会把 16KB 的上限实际放宽到约 48KB。
+      // 先扣掉包装（标签 + header + 提示语）的字节数，再退到字符边界，
+      // 避免把多字节字符切成两半（产生 U+FFFD）。
+      const notice =
+        `（记忆内容共 ${Buffer.byteLength(body, 'utf8')} 字节，超过本次注入上限 ${maxBytes} 字节；` +
+        '**下面只是前面一段，剩余内容没有被删除**：请用 read 工具直接读上面 ' +
+        '`<!-- scope: ... -->` 标注的记忆文件路径补齐，不要因为没注入就当作不存在。）';
+      const overhead = Buffer.byteLength(
+        `<system-reminder>\n${header}\n\n${notice}\n\n\n</system-reminder>`,
+        'utf8',
+      );
+      const raw = Buffer.from(body, 'utf8');
+      let end = Math.max(0, Math.min(raw.length, maxBytes - overhead));
+      while (end > 0 && (raw[end] & 0xc0) === 0x80) end--;
+      content = `<system-reminder>\n${header}\n\n${notice}\n\n${raw.subarray(0, end).toString('utf8')}\n</system-reminder>`;
     }
 
     injected.add(agent);
@@ -636,31 +700,66 @@ export function apply(ctx, config = {}) {
 
   const memoryRecall = defineTool({
     name: 'memory_recall',
-    description: '在用户记忆文件里按关键词做纯文本搜索，返回匹配到的行。多个关键词之间是「与」关系。',
+    description:
+      '在用户记忆文件里按关键词搜索：多个关键词是「或」关系，全部整词命中的排最前；中文长词支持部分命中（搜"孩子奥数"能命中只写了"三年级奥数"的行）；每条结果带文件与行号，按相关度排序。',
     parameters: {
       terms: { type: 'string', required: true, description: '空格分隔的关键词，例如 "相机 镜头"。' },
+      limit: { type: 'number', description: '最多返回多少条，默认 20，上限 200。' },
     },
     output: {
-      schema: { type: 'object', additionalProperties: false, properties: { hits: { type: 'array', items: { type: 'string' }, required: true }, scanned: { type: 'array', items: { type: 'string' }, required: true } } },
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          hits: {
+            type: 'array',
+            required: true,
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                scope: { type: 'string', required: true },
+                file: { type: 'string', required: true },
+                line: { type: 'number', required: true },
+                score: { type: 'number', required: true },
+                text: { type: 'string', required: true },
+              },
+            },
+          },
+          total: { type: 'number', required: true },
+          scanned: { type: 'array', items: { type: 'string' }, required: true },
+        },
+      },
       render: (_args, value) => {
         if (value.hits.length === 0) {
           return [{ type: 'text', text: value.scanned.length ? `未命中。已扫描：\n${value.scanned.join('\n')}` : '未命中：没有可读的记忆文件。' }];
         }
-        return [{ type: 'text', text: `命中 ${value.hits.length} 行：\n${value.hits.map((h) => h.trim()).join('\n')}` }];
+        const shown = value.hits.map((h) => `${h.scope}/${h.file}:${h.line}  ${h.text.trim()}`);
+        const head = value.total > value.hits.length
+          ? `命中 ${value.total} 行，按相关度只显示前 ${value.hits.length} 条（文件:行号 内容）：`
+          : `命中 ${value.total} 行（已按相关度排序，文件:行号 内容）：`;
+        return [{ type: 'text', text: `${head}\n${shown.join('\n')}` }];
       },
     },
     async execute(args, exec) {
       const paths = pathsFor(exec?.agent);
       const terms = String(args.terms).split(/\s+/).filter(Boolean);
-      const hits = [];
+      const wanted = Number(args.limit);
+      const limit = Number.isFinite(wanted) && wanted > 0 ? Math.min(Math.floor(wanted), 200) : 20;
+      const all = [];
       const scanned = [];
-      for (const file of [paths.global, paths.workspace].filter(Boolean)) {
+      for (const [scope, file] of [['global', paths.global], ['workspace', paths.workspace]]) {
+        if (!file) continue;
         const text = readIfExists(file);
         if (text === undefined) continue;
         scanned.push(file);
-        hits.push(...searchLines(text, terms));
+        const base = file.split(/[\\/]/).pop();
+        for (const hit of searchLines(text, terms)) {
+          all.push({ scope, file: base, line: hit.line, score: hit.score, text: hit.text });
+        }
       }
-      return { hits: hits.slice(0, 200), scanned };
+      all.sort((a, b) => b.score - a.score || a.text.length - b.text.length || a.line - b.line);
+      return { hits: all.slice(0, limit), total: all.length, scanned };
     },
   });
 

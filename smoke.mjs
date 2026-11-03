@@ -275,7 +275,33 @@ await check('同一会话只注入一次（step 1 之外不重复注入）', asy
 await check('memory_recall 能按关键词搜到', async () => {
   const r = await recallTool.execute({ terms: '简洁 回答' }, { agent: fakeAgent });
   assert.ok(r.hits.length >= 1, '未搜到');
-  assert.ok(r.hits[0].includes('喜欢简洁的回答'));
+  assert.ok(r.hits[0].text.includes('喜欢简洁的回答'));
+});
+
+// ── v1.3.0：检索从「全词 AND / 无排序 / 无行号」改成「拆词 OR + 相关度排序 + 行号」 ──
+// 真实失败案例：记忆里写的是「浅奥」「三年级奥数」，用户/agent 搜「孩子奥数」时旧实现
+// 要求整词包含，命中 0 行。下面三条断言守的就是这次改动的三个卖点。
+await check('memory_recall 中文长词能部分命中（「孩子奥数」命中只写了「三年级奥数」的行）', async () => {
+  writeFileSync(memoryFile, '# 记忆\n\n- 孩子在学三年级奥数，浅奥二年级水平\n', 'utf8');
+  const r = await recallTool.execute({ terms: '孩子奥数' }, { agent: fakeAgent });
+  assert.ok(r.hits.length >= 1, '未命中：拆词/部分命中没生效');
+  assert.ok(r.hits.some((h) => h.text.includes('三年级奥数')), '没命中含「三年级奥数」的那一行');
+});
+
+await check('memory_recall 返回行号，且行号能定位回原文', async () => {
+  const r = await recallTool.execute({ terms: '三年级奥数' }, { agent: fakeAgent });
+  const hit = r.hits.find((h) => h.text.includes('三年级奥数'));
+  assert.ok(hit, '未命中');
+  assert.ok(Number.isInteger(hit.line) && hit.line >= 1, `行号应为正整数，实际 ${hit.line}`);
+  const lines = readFileSync(memoryFile, 'utf8').split('\n');
+  assert.equal(lines[hit.line - 1], hit.text, '行号与原文对不上');
+});
+
+await check('memory_recall 多词为「或」，全部整词命中的排在前面', async () => {
+  writeFileSync(memoryFile, ['# 记忆', '', '- 相机 镜头 两个词都整词命中', '- 只有相机这一个词', ''].join('\n'), 'utf8');
+  const r = await recallTool.execute({ terms: '相机 镜头' }, { agent: fakeAgent });
+  assert.equal(r.hits.length, 2, `多词应为「或」关系，期望 2 行，实际 ${r.hits.length}`);
+  assert.ok(r.hits[0].text.includes('镜头'), `整词全中的行应排第一，实际第一行是：${r.hits[0].text}`);
 });
 
 await check('memory_list 报告文件位置与大小', async () => {
@@ -638,7 +664,11 @@ if (process.argv.includes('--profile')) {
     const ins = doc.filter((x) => x && x.insert).flatMap((x) => x.insert);
     const mf = ins.filter((x) => x.id === 'memory-file');
     assert.equal(mf.length, 1, 'memory-file 插入条目数应为 1');
-    assert.equal(mf[0].config.maxBytes, 16384, 'maxBytes 应为 16384');
+    assert.equal(
+      mf[0].config.maxBytes,
+      1048576,
+      'maxBytes 应为 1048576（2026-10-08：16 KB 对中文只有约 5,500 字，会触发「已截断」；改为 1 MB 安全阀）',
+    );
   });
 
   await check('package.json 无 UTF-8 BOM（BOM 会让 pnpm 解析失败）', () => {
