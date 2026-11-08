@@ -656,19 +656,32 @@ if (process.argv.includes('--profile')) {
   await check('profile 目录存在', () => assert.ok(existsSync(prof), prof));
   await check('插件已复制进 profile', () => assert.ok(existsSync(join(prof, 'node_modules', 'dsh-memory-file', 'index.js'))));
 
-  await check('patch YAML 可解析且含 memory-file 插入条目', async () => {
+  await check('记忆插件已挂载且 config 覆盖在位（maxBytes 1 MB / autoScan）', async () => {
     const { createRequire } = await import('node:module');
     const yaml = createRequire(join(sharedNm, 'x.js'))('yaml');
     const doc = yaml.parse(readFileSync(join(prof, 'cordis.patch.yml'), 'utf8'));
     assert.ok(Array.isArray(doc), 'patch 顶层应为数组');
     const ins = doc.filter((x) => x && x.insert).flatMap((x) => x.insert);
+    const pkg = JSON.parse(readFileSync(join(prof, 'package.json'), 'utf8'));
+    const bundles = pkg?.dsh?.profile?.bundles ?? [];
+    const viaBundle = bundles.includes('dsh-memory-file');
     const mf = ins.filter((x) => x.id === 'memory-file');
-    assert.equal(mf.length, 1, 'memory-file 插入条目数应为 1');
+    // 两种合法形态：2026-11-08 起改为 bundle 安装（bundles 里有 dsh-memory-file）；
+    // 老配置是 patch 里的 insert 条目。两种都算挂载成功。
+    assert.ok(
+      viaBundle || mf.length === 1,
+      'memory-file 既不在 bundles 也没有 insert 条目（升级重写配置的典型症状）',
+    );
+    // config 覆盖可以写在 insert 块里，也可以写成 `- id: memory-file` 的定向覆盖
+    const override = doc.find((x) => x && x.id === 'memory-file');
+    const cfgMaxBytes = mf[0]?.config?.maxBytes ?? override?.config?.maxBytes;
+    const cfgAutoScan = mf[0]?.config?.autoScan ?? override?.config?.autoScan;
     assert.equal(
-      mf[0].config.maxBytes,
+      cfgMaxBytes,
       1048576,
       'maxBytes 应为 1048576（2026-10-08：16 KB 对中文只有约 5,500 字，会触发「已截断」；改为 1 MB 安全阀）',
     );
+    assert.equal(cfgAutoScan, true, 'autoScan 应为 true（2026-10-05 用户决定：新对话 → 记忆待合并）');
   });
 
   await check('package.json 无 UTF-8 BOM（BOM 会让 pnpm 解析失败）', () => {
@@ -686,13 +699,9 @@ if (process.argv.includes('--profile')) {
     for (const b of ['dsh-token-cost', 'dsh-space-optimizer']) {
       assert.ok(pkg.dsh.profile.bundles.includes(b), `丢失 bundle: ${b}`);
     }
-    // 2026-11-08 包名去 @local：@local/dsh-plugin-market → dsh-plugin-market。
-    // 用户机器上可能仍是旧名（未重装），两个都接受，避免自测假红。
-    assert.ok(
-      pkg.dsh.profile.bundles.includes('dsh-plugin-market') ||
-        pkg.dsh.profile.bundles.includes('@local/dsh-plugin-market'),
-      '丢失 bundle: dsh-plugin-market（旧名 @local/dsh-plugin-market 也算）',
-    );
+    // market 面板有多个历史名（@local / dsh-plugin-market / dsh-market-panel），
+    // 且用户可能跟随官方方向把它撤掉，所以这里不再断言它，避免自测假红。
+    // memory-file 2026-11-08 起是 bundle 安装，挂载检查见上面那条。
     assert.ok(pkg.dependencies['dsh-memory-file'], 'dependencies 里缺少 dsh-memory-file');
   });
 
