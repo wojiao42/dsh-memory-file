@@ -683,9 +683,16 @@ if (process.argv.includes('--profile')) {
     const pkg = JSON.parse(readFileSync(join(prof, 'package.json'), 'utf8'));
     assert.ok(Array.isArray(pkg.dsh.profile.bundles));
     // 注意用实际的依赖名（dsh-token-cost 没有 @local 前缀）
-    for (const b of ['@local/dsh-plugin-market', 'dsh-token-cost', 'dsh-space-optimizer']) {
+    for (const b of ['dsh-token-cost', 'dsh-space-optimizer']) {
       assert.ok(pkg.dsh.profile.bundles.includes(b), `丢失 bundle: ${b}`);
     }
+    // 2026-11-08 包名去 @local：@local/dsh-plugin-market → dsh-plugin-market。
+    // 用户机器上可能仍是旧名（未重装），两个都接受，避免自测假红。
+    assert.ok(
+      pkg.dsh.profile.bundles.includes('dsh-plugin-market') ||
+        pkg.dsh.profile.bundles.includes('@local/dsh-plugin-market'),
+      '丢失 bundle: dsh-plugin-market（旧名 @local/dsh-plugin-market 也算）',
+    );
     assert.ok(pkg.dependencies['dsh-memory-file'], 'dependencies 里缺少 dsh-memory-file');
   });
 
